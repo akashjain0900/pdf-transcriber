@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ledger-transcriber"
+description = "Batch transcription of scanned historical books via the Gemini API"
+readme = "README.md"
+requires-python = ">=3.10"
+
+# Written literally. Do NOT make this dynamic: reading it from the package makes
+# setuptools import the package during the build, which fails on some
+# setuptools versions with "No module named 'ledger'". Bump this alongside
+# APP_VERSION in ledger/config.py.
+version = "0.4.1"
+
+dependencies = [
+    # PDF rendering. Import as `pymupdf`; the old `fitz` name is deprecated
+    # in 1.28+.
+    "pymupdf>=1.24",
+
+    # HTTP client for the Gemini REST endpoint. Used instead of google-genai
+    # so retry, quota and auth behaviour stays under our own control.
+    "requests>=2.31",
+
+    # Image handling: needed for deskew, and for the local text detection that
+    # picks the profiler's sample pages.
+    "Pillow>=10.0",
+    "numpy>=1.26",
+
+    # Web UI: the API server and the ASGI server that runs it.
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+
+    # REQUIRED ON WINDOWS, harmless elsewhere.
+    #
+    # All quota accounting keys off the US Pacific date, because that is when
+    # Google resets daily limits. zoneinfo looks up "America/Los_Angeles" in
+    # the operating system's timezone database — which Linux and macOS have
+    # and Windows does not. Without this package, quota.py raises
+    # ZoneInfoNotFoundError at IMPORT time on Windows, which takes down the
+    # whole application rather than degrading.
+    "tzdata; platform_system == 'Windows'",
+]
+
+[project.optional-dependencies]
+# Test-only. `pip install -e ".[dev]"` before running tests/test_api.py:
+# Starlette's TestClient needs an HTTP client library that the runtime does
+# not, so a plain install cannot run that suite.
+dev = [
+    "pytest>=7.0",
+    "httpx2",
+]
+
+[project.scripts]
+# Gives you a plain `ledger` command anywhere, instead of needing to be in the
+# project root for `python -m ledger.cli` to resolve.
+ledger = "ledger.cli:main"
+
+[tool.setuptools]
+packages = ["ledger"]
+
+# The UI is a data file inside the package, not Python, so it must be declared
+# explicitly — otherwise an installed copy serves a 500 with no index.html.
+[tool.setuptools.package-data]
+ledger = ["static/*.html"]

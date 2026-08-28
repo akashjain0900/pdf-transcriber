@@ -1,0 +1,19 @@
+# Secrets — never commit these.
+.env
+keys.json
+*.db
+*.db-wal
+*.db-shm
+
+# Working output.
+exports/
+pdfs/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+venv/
+.venv/
+
+Dump/
+ledger_transcriber.egg-info/

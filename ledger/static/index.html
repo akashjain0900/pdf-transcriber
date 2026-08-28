@@ -1,0 +1,1157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ledger &middot; Old Book Transcriber</title>
+<style>
+  :root{
+    --paper:#F2ECE0;
+    --paper-2:#EAE2D0;
+    --ink:#26221C;
+    --ink-soft:#5B5445;
+    --rule:#C9BFA8;
+    --accent:#6E2A20;      /* oxblood / sealing wax */
+    --accent-ink:#F2ECE0;
+    --link:#2B3A55;        /* ledger-ink blue */
+    --success:#3F6E4C;
+    --warn:#A6791F;
+    --danger:#A23E32;
+    --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    --serif: 'Source Serif 4', Georgia, 'Times New Roman', serif;
+    --sans: 'IBM Plex Sans', -apple-system, Segoe UI, sans-serif;
+    --radius: 3px;
+  }
+  * { box-sizing: border-box; }
+  html,body{ height:100%; }
+  body{
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:var(--sans); font-size:14px; line-height:1.45;
+  }
+  ::selection{ background: var(--accent); color: var(--accent-ink); }
+  a{ color:var(--link); }
+
+  #app{ display:flex; flex-direction:column; height:100vh; }
+
+  header.top{
+    display:flex; align-items:center; gap:18px;
+    padding:14px 20px; border-bottom:1px solid var(--rule);
+    background:var(--paper-2);
+  }
+  header.top h1{
+    font-family:var(--serif); font-weight:600; font-size:19px; margin:0;
+    letter-spacing:0.2px; display:flex; align-items:baseline; gap:8px;
+  }
+  header.top h1 small{ font-family:var(--mono); font-size:11px; color:var(--ink-soft); font-weight:400; }
+
+  .stamp{
+    font-family:var(--mono); font-size:12px; border:1.5px solid var(--accent);
+    color:var(--accent); border-radius:50px; padding:4px 12px;
+    display:flex; align-items:center; gap:8px; white-space:nowrap;
+  }
+  .stamp b{ font-size:13px; }
+  .stamp.muted{ border-color:var(--rule); color:var(--ink-soft); }
+
+  .spacer{ flex:1; }
+
+  button{
+    font-family:var(--sans); font-size:13px; border:1px solid var(--ink);
+    background:var(--paper); color:var(--ink); padding:7px 14px;
+    border-radius:var(--radius); cursor:pointer;
+  }
+  button:hover{ background:var(--ink); color:var(--paper); }
+  button.primary{ background:var(--accent); border-color:var(--accent); color:var(--accent-ink); }
+  button.primary:hover{ opacity:0.88; background:var(--accent); color:var(--accent-ink); }
+  button.ghost{ border-color:var(--rule); color:var(--ink-soft); }
+  button.ghost:hover{ background:var(--ink-soft); color:var(--paper); }
+  button:disabled{ opacity:0.4; cursor:not-allowed; }
+  button:disabled:hover{ background:var(--paper); color:var(--ink); }
+  button.primary:disabled:hover{ background:var(--accent); color:var(--accent-ink); }
+  button.small{ padding:3px 9px; font-size:11px; }
+  button.danger-outline{ border-color: var(--danger); color: var(--danger); }
+  button.danger-outline:hover{ background:var(--danger); color:#fff; }
+  button:focus-visible{ outline:2px solid var(--link); outline-offset:2px; }
+
+  nav.tabs{
+    display:flex; gap:2px; padding:0 20px; background:var(--paper-2);
+    border-bottom:1px solid var(--rule);
+  }
+  nav.tabs button{
+    border:none; border-bottom:2px solid transparent; border-radius:0;
+    background:transparent; padding:10px 14px; font-size:13px; color:var(--ink-soft);
+  }
+  nav.tabs button:hover{ background:var(--rule); color:var(--ink); }
+  nav.tabs button.active{ color:var(--accent); border-bottom-color:var(--accent); font-weight:600; }
+
+  main{ flex:1; overflow:hidden; display:flex; }
+  section.view{ flex:1; display:none; overflow:hidden; }
+  section.view.active{ display:flex; }
+  section.view.active.view-block{ display:block; overflow-y:auto; }
+
+  /* --- Books view --- */
+  #books-list{
+    width:340px; min-width:300px; border-right:1px solid var(--rule);
+    overflow-y:auto; background:var(--paper-2);
+    display:flex; flex-direction:column;
+  }
+  #books-list .list-head{
+    padding:10px 14px; font-family:var(--mono); font-size:11px; color:var(--ink-soft);
+    text-transform:uppercase; letter-spacing:0.06em; border-bottom:1px solid var(--rule);
+    display:flex; justify-content:space-between; align-items:center;
+  }
+  #books-list-body{ flex:1; overflow-y:auto; }
+  .book-row{
+    padding:10px 14px; border-bottom:1px solid var(--rule); cursor:pointer;
+  }
+  .book-row:hover{ background:var(--rule); }
+  .book-row.selected{ background:var(--paper); border-left:3px solid var(--accent); }
+  .book-row .name{ font-size:13px; font-weight:600; margin-bottom:4px; word-break:break-word; }
+  .book-row .meta{ font-family:var(--mono); font-size:11px; color:var(--ink-soft); display:flex; justify-content:space-between; }
+  .progress-bar{ height:5px; background:var(--rule); border-radius:3px; overflow:hidden; margin-top:6px; display:flex; }
+  .progress-bar > div{ height:100%; }
+  .progress-bar > div.done{ background:var(--success); }
+  .progress-bar > div.flagged{ background:var(--warn); }
+  .progress-bar > div.failed{ background:var(--danger); }
+  .dot{ display:inline-block; width:7px; height:7px; border-radius:50%; margin-right:5px; }
+  .dot.queued{ background:var(--ink-soft); }
+  .dot.processing{ background:var(--link); animation:pulse 1.2s infinite; }
+  .dot.done{ background:var(--success); }
+  .dot.error{ background:var(--danger); }
+  .dot.paused{ background:var(--warn); }
+  @keyframes pulse{ 0%,100%{opacity:1;} 50%{opacity:0.3;} }
+  @media (prefers-reduced-motion: reduce){
+    .dot.processing{ animation:none; }
+  }
+
+  #book-detail{ flex:1; overflow-y:auto; padding:20px 26px; }
+  #book-detail h2{ font-family:var(--serif); font-size:20px; margin:0 0 4px; }
+  #book-detail .sub{ font-family:var(--mono); font-size:12px; color:var(--ink-soft); margin-bottom:16px; }
+  .page-grid{
+    display:grid; grid-template-columns:repeat(auto-fill,minmax(30px,1fr)); gap:3px; max-width:640px;
+  }
+  .page-cell{
+    aspect-ratio:1; border-radius:2px; font-family:var(--mono); font-size:9px;
+    display:flex; align-items:center; justify-content:center; color:var(--paper);
+    cursor:pointer; border:none; padding:0;
+  }
+  .page-cell:hover{ outline:2px solid var(--ink); outline-offset:1px; }
+  .page-cell.pending{ background:var(--rule); color:var(--ink-soft); }
+  .page-cell.in_progress{ background:var(--link); animation:pulse 1.2s infinite; }
+  .page-cell.done{ background:var(--success); }
+  .page-cell.flagged{ background:var(--warn); }
+  .page-cell.failed{ background:var(--danger); }
+  .empty-state{ color:var(--ink-soft); font-style:italic; padding:40px 0; text-align:center; }
+  .legend{ font-family:var(--mono); font-size:11px; color:var(--ink-soft); margin:14px 0 4px; display:flex; gap:14px; flex-wrap:wrap; }
+  .legend span{ display:flex; align-items:center; gap:5px; }
+  .legend i{ width:10px; height:10px; border-radius:2px; display:inline-block; }
+
+  .profile-box{
+    background:var(--paper-2); border:1px solid var(--rule); border-radius:var(--radius);
+    padding:10px 14px; margin:14px 0; font-size:12.5px;
+  }
+  .profile-box dt{ font-family:var(--mono); font-size:10.5px; text-transform:uppercase;
+    letter-spacing:0.05em; color:var(--ink-soft); }
+  .profile-box dd{ margin:0 0 8px; }
+  .profile-box dl{ margin:0; display:grid; grid-template-columns:130px 1fr; gap:2px 12px; }
+
+  #page-modal-backdrop{
+    position:fixed; inset:0; background:rgba(38,34,28,0.6); z-index:1000;
+    display:none; align-items:center; justify-content:center; padding:24px;
+  }
+  #page-modal-backdrop.open{ display:flex; }
+  #page-modal{
+    background:var(--paper); border-radius:6px; width:100%; max-width:920px; max-height:88vh;
+    display:flex; flex-direction:column; overflow:hidden; box-shadow:0 12px 40px rgba(0,0,0,0.35);
+  }
+  #page-modal .modal-header{
+    display:flex; align-items:center; gap:8px; padding:9px 14px; border-bottom:1px solid var(--rule); background:var(--paper-2);
+  }
+  #page-modal .nav-btn{ width:28px; height:28px; padding:0; display:inline-flex; align-items:center; justify-content:center; }
+  #page-modal .page-type-badge{ font-family:var(--mono); font-size:11px; padding:3px 9px; border-radius:20px; }
+  #page-modal .modal-body{ flex:1; display:flex; overflow:hidden; min-height:320px; }
+  #page-modal .modal-image-pane{
+    flex:1.1; background:var(--paper-2); display:flex; align-items:center; justify-content:center;
+    padding:16px; border-right:1px solid var(--rule); overflow:auto;
+  }
+  #page-modal .modal-image-pane img{ max-width:100%; max-height:70vh; box-shadow:0 2px 10px rgba(0,0,0,0.18); background:#fff; }
+  #page-modal .modal-text-pane{ flex:1; padding:16px 22px; overflow-y:auto; }
+  #page-modal .modal-text-pane .transcription{ font-family:var(--serif); font-size:14.5px; line-height:1.75; white-space:pre-wrap; margin:0; }
+  #page-modal .modal-text-pane .placeholder{ color:var(--ink-soft); font-style:italic; margin:0 0 8px; }
+  #page-modal .modal-text-pane h4{ font-family:var(--mono); font-size:10.5px; text-transform:uppercase;
+    letter-spacing:0.05em; color:var(--ink-soft); margin:18px 0 4px; }
+  #page-modal .provenance{ font-family:var(--mono); font-size:11px; color:var(--ink-soft); line-height:1.7; }
+
+  /* --- Keys view --- */
+  #view-keys{ padding:20px 26px; }
+  table.keys{ width:100%; max-width:960px; border-collapse:collapse; margin-top:14px; }
+  table.keys th{ text-align:left; font-family:var(--mono); font-size:11px; text-transform:uppercase;
+    letter-spacing:0.05em; color:var(--ink-soft); border-bottom:1px solid var(--ink); padding:6px 8px; }
+  table.keys td{ padding:8px; border-bottom:1px solid var(--rule); font-size:13px; vertical-align:middle; }
+  table.keys input[type=text], table.keys input[type=password], table.keys input[type=number]{
+    font-family:var(--mono); font-size:12px; padding:5px 7px; border:1px solid var(--rule);
+    border-radius:var(--radius); width:100%; background:var(--paper);
+  }
+  .usage-mini{ font-family:var(--mono); font-size:11px; color:var(--ink-soft); }
+  .key-state{ font-family:var(--mono); font-size:11px; padding:2px 8px; border-radius:20px; display:inline-block; }
+  .key-state.active{ background:var(--success); color:#fff; }
+  .key-state.exhausted{ background:var(--warn); color:#fff; }
+  .key-state.cooldown{ background:var(--link); color:#fff; }
+  .key-state.dead{ background:var(--danger); color:#fff; }
+
+  /* --- Settings view --- */
+  #view-settings{ padding:20px 26px; max-width:760px; }
+  .field-group{ margin-bottom:20px; padding-bottom:18px; border-bottom:1px solid var(--rule); }
+  .field-group h3{ font-family:var(--serif); font-size:15px; margin:0 0 10px; }
+  .field-row{ display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+  .field-row label{ width:220px; font-size:12.5px; color:var(--ink-soft); flex-shrink:0; }
+  .field-row input[type=text], .field-row input[type=password], .field-row input[type=number]{
+    flex:1; font-family:var(--mono); font-size:12.5px; padding:6px 8px; border:1px solid var(--rule);
+    border-radius:var(--radius); background:var(--paper);
+  }
+  .hint{ font-size:11.5px; color:var(--ink-soft); margin-top:2px; }
+  .status-pill{ font-family:var(--mono); font-size:11px; padding:3px 9px; border-radius:20px; display:inline-block; }
+  .status-pill.ok{ background:var(--success); color:#fff; }
+  .status-pill.no{ background:var(--rule); color:var(--ink-soft); }
+  .status-pill.warn{ background:var(--warn); color:#fff; }
+  .status-pill.err{ background:var(--danger); color:#fff; }
+  dl.readonly{ margin:0; display:grid; grid-template-columns:220px 1fr; gap:4px 12px; font-size:12.5px; }
+  dl.readonly dt{ color:var(--ink-soft); }
+  dl.readonly dd{ margin:0; font-family:var(--mono); font-size:12px; word-break:break-all; }
+
+  /* --- Setup view --- */
+  #view-setup{ padding:20px 26px; max-width:780px; }
+  .setup-steps{ margin:0 0 22px; padding:0; list-style:none; counter-reset:step; }
+  .setup-steps li{ counter-increment:step; position:relative; padding:0 0 16px 34px; font-size:13.5px; line-height:1.55; }
+  .setup-steps li::before{
+    content:counter(step); position:absolute; left:0; top:0; width:22px; height:22px; border-radius:50%;
+    background:var(--accent); color:var(--accent-ink); font-family:var(--mono); font-size:11px;
+    display:flex; align-items:center; justify-content:center;
+  }
+  .setup-steps code{ background:var(--paper-2); padding:1px 5px; border-radius:3px; font-family:var(--mono); font-size:12px; }
+  #codegs-source{
+    width:100%; height:280px; box-sizing:border-box; resize:vertical; font-family:var(--mono); font-size:11px;
+    background:var(--ink); color:#E9E3D3; border:1px solid var(--rule); border-radius:var(--radius); padding:12px;
+  }
+
+  /* --- Log view --- */
+  #view-log{ padding:0; }
+  #log-console{
+    height:100%; overflow-y:auto; background:var(--ink); color:#E9E3D3;
+    font-family:var(--mono); font-size:12px; padding:16px 20px; white-space:pre-wrap;
+  }
+  #log-console .l-err{ color:#E8998D; }
+  #log-console .l-warn{ color:#E3C27E; }
+  #log-console .l-ok{ color:#9BCBA6; }
+  #log-console .line{ margin-bottom:3px; }
+
+  .checkbox-row{ display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+  .checkbox-row label{ font-size:12.5px; color:var(--ink-soft); }
+
+  #toast{
+    position:fixed; bottom:22px; left:50%; transform:translateX(-50%);
+    background:var(--ink); color:var(--paper); font-size:13px;
+    padding:10px 18px; border-radius:var(--radius); z-index:2000;
+    box-shadow:0 6px 20px rgba(0,0,0,0.3); display:none; max-width:70vw;
+  }
+  #toast.err{ background:var(--danger); }
+  #toast.show{ display:block; }
+
+  ::-webkit-scrollbar{ width:10px; height:10px; }
+  ::-webkit-scrollbar-thumb{ background:var(--rule); border-radius:6px; }
+  ::-webkit-scrollbar-track{ background:transparent; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header class="top">
+    <h1>Ledger <small id="app-version">old&nbsp;book&nbsp;transcriber</small></h1>
+    <div class="stamp" id="stamp-quota">&#9679; <b id="stamp-used">0</b>/<span id="stamp-cap">0</span> today</div>
+    <div class="stamp muted" id="stamp-eta">~<b id="stamp-days">&mdash;</b> days left</div>
+    <div class="spacer"></div>
+    <button class="ghost" id="btn-rescan">Rescan folder</button>
+    <button class="primary" id="btn-toggle-run">Start queue</button>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab-btn active" data-view="books">Books</button>
+    <button class="tab-btn" data-view="keys">API Keys</button>
+    <button class="tab-btn" data-view="settings">Sheets &amp; Settings</button>
+    <button class="tab-btn" data-view="setup">Sheet setup</button>
+    <button class="tab-btn" data-view="log">Log</button>
+  </nav>
+
+  <main>
+    <!-- ===================== BOOKS ===================== -->
+    <section class="view active" id="view-books">
+      <div id="books-list">
+        <div class="list-head"><span>Books</span><span id="books-count">0</span></div>
+        <div id="books-list-body"></div>
+        <div style="padding:10px 14px;border-top:1px solid var(--rule);">
+          <button class="ghost small" id="btn-publish-all" style="width:100%;">Publish all to Sheet</button>
+        </div>
+      </div>
+      <div id="book-detail"><div class="empty-state">Select a book to see its pages.</div></div>
+    </section>
+
+    <!-- ===================== KEYS ===================== -->
+    <section class="view view-block" id="view-keys">
+      <h2 style="font-family:var(--serif);font-size:18px;margin:0;">Gemini API keys</h2>
+      <p class="hint" style="max-width:760px;">
+        One row per key. Quota is enforced per Google Cloud <b>project</b>, not per key, so
+        keys from the same project share one allowance &mdash; only keys from separate
+        accounts or projects add capacity. Each live key runs its own worker.
+      </p>
+      <p class="hint" style="max-width:760px;">
+        Set the daily limit from what AI&nbsp;Studio shows for that account. If it is too
+        high, Ledger learns the real ceiling from repeated refusals and corrects itself.
+        Counters reset at midnight <b>US&nbsp;Pacific</b>, which is when Google resets them.
+      </p>
+
+      <table class="keys">
+        <thead><tr>
+          <th style="width:16%">Label</th>
+          <th style="width:10%">Key</th>
+          <th style="width:11%">State</th>
+          <th style="width:14%">Used today</th>
+          <th style="width:9%">Per min</th>
+          <th style="width:9%">Per day</th>
+          <th>Note</th>
+          <th style="width:8%"></th>
+        </tr></thead>
+        <tbody id="keys-body"></tbody>
+      </table>
+
+      <div class="field-group" style="margin-top:24px;max-width:760px;">
+        <h3>Add or update a key</h3>
+        <p class="hint">Saving with an existing label updates that key without resetting today's usage.</p>
+        <div class="field-row"><label>Label</label><input type="text" id="new-key-label" placeholder="acct-01"></div>
+        <div class="field-row"><label>API key</label><input type="password" id="new-key-secret" placeholder="AIza..."></div>
+        <div class="field-row"><label>Requests per minute</label><input type="number" id="new-key-rpm" value="10" min="0"></div>
+        <div class="field-row"><label>Requests per day</label><input type="number" id="new-key-rpd" value="250" min="1"></div>
+        <button class="primary" id="btn-save-key">Save key</button>
+      </div>
+    </section>
+
+    <!-- ===================== SETTINGS ===================== -->
+    <section class="view view-block" id="view-settings">
+      <div class="field-group">
+        <h3>Google Sheets</h3>
+        <p class="hint">
+          No Google sign-in needed. See <b>Sheet setup</b> for the one-time walkthrough,
+          then paste the deployed Web App URL here.
+        </p>
+        <div class="field-row">
+          <label>Apps Script Web App URL</label>
+          <input type="text" id="set-sheets-url" placeholder="https://script.google.com/macros/s/.../exec">
+        </div>
+        <div class="field-row">
+          <label>Shared secret</label>
+          <input type="password" id="set-sheets-secret" placeholder="leave blank to keep the saved one">
+        </div>
+        <div class="field-row">
+          <label>Connection</label>
+          <span class="status-pill no" id="sheets-pill">Not tested</span>
+          <button class="ghost small" id="btn-test-sheets" style="margin-left:10px;">Test</button>
+        </div>
+        <button class="primary" id="btn-save-sheets" style="margin-top:6px;">Save</button>
+        <p class="hint">
+          Each book gets its own tab, and an <b>Index</b> tab lists them all. Pages are written
+          to the row matching their page number, so publishing twice produces the same sheet
+          rather than duplicate rows.
+        </p>
+      </div>
+
+      <div class="field-group">
+        <h3>Publish to Sheet</h3>
+        <p class="hint">
+          Transcriptions live locally and are pushed when you choose. Only pages with a
+          result are sent, so a part-finished book publishes cleanly and can be
+          republished later.
+        </p>
+        <div class="field-row">
+          <label>Status</label>
+          <span class="status-pill no" id="publish-pill">Idle</span>
+          <button class="ghost small" id="btn-publish-cancel" style="margin-left:10px;display:none;">Cancel</button>
+        </div>
+        <button class="primary" id="btn-publish-settings">Publish all books</button>
+      </div>
+
+      <div class="field-group">
+        <h3>Export JSON</h3>
+        <p class="hint">
+          Writes one JSONL file per book plus manifests, into the export folder shown below.
+          This is the durable artifact; the database is the working store.
+        </p>
+        <button class="ghost" id="btn-export">Write export files</button>
+        <button class="ghost" id="btn-download-index">Download index.json</button>
+      </div>
+
+      <div class="field-group">
+        <h3>Retry pages</h3>
+        <p class="hint">
+          Each retried page costs a fresh request from today's allowance, which is why
+          nothing is retried automatically.
+        </p>
+        <div class="checkbox-row"><input type="checkbox" id="requeue-flagged" checked><label for="requeue-flagged">Flagged pages (transcribed, but failed a quality check)</label></div>
+        <div class="checkbox-row"><input type="checkbox" id="requeue-failed"><label for="requeue-failed">Failed pages (gave up after repeated errors)</label></div>
+        <button class="ghost" id="btn-requeue-all">Return selected pages to the queue</button>
+      </div>
+
+      <div class="field-group" style="border-bottom:none;">
+        <h3>Engine settings</h3>
+        <p class="hint">
+          These come from <code>.env</code> and are shown read-only on purpose: changing DPI or
+          resolution mid-corpus would leave you with pages transcribed under different
+          settings and no easy way to tell which is which. Edit <code>.env</code> and restart to
+          change them.
+        </p>
+        <dl class="readonly" id="config-readonly"></dl>
+      </div>
+    </section>
+
+    <!-- ===================== SHEET SETUP ===================== -->
+    <section class="view view-block" id="view-setup">
+      <h2 style="font-family:var(--serif);font-size:18px;margin:0 0 4px;">One-time sheet setup</h2>
+      <p class="hint" style="margin-bottom:18px;">
+        Only needed if you want transcriptions in Google Sheets. The JSON export works
+        without any of this.
+      </p>
+      <ol class="setup-steps">
+        <li>Open <a href="https://sheets.google.com" target="_blank" rel="noopener">sheets.google.com</a> and create a blank spreadsheet. Transcriptions go here, one tab per book.</li>
+        <li>In that sheet: <b>Extensions &rarr; Apps Script</b>. Delete the placeholder code.</li>
+        <li>Copy the script below and paste it in, replacing everything.</li>
+        <li>Optional: set <code>SHARED_SECRET</code> near the top to any string, then enter the same string under <b>Sheets &amp; Settings</b>. Without it, anyone with your Web App URL can write to the sheet.</li>
+        <li>Click <b>Deploy &rarr; New deployment</b>, type <b>Web app</b>. Set "Execute as" to <b>Me</b> and "Who has access" to <b>Anyone</b>. Deploy, then authorise it (click through the "unverified app" warning &mdash; it is your own script).</li>
+        <li>Copy the Web App URL into <b>Sheets &amp; Settings</b> and click <b>Test</b>.</li>
+      </ol>
+      <p class="hint">
+        If you edit the script later, use <b>Deploy &rarr; Manage deployments &rarr; edit (pencil) &rarr; New version</b>,
+        otherwise the live URL keeps running the old code. The Test button reports the deployed
+        version so a stale deployment is visible.
+      </p>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin:14px 0 6px;">
+        <span style="font-family:var(--mono);font-size:11px;color:var(--ink-soft);text-transform:uppercase;letter-spacing:0.05em;">Code.gs <span id="script-version"></span></span>
+        <span>
+          <button class="ghost small" id="btn-copy-script">Copy script</button>
+          <button class="ghost small" id="btn-download-script">Download as file</button>
+        </span>
+      </div>
+      <textarea id="codegs-source" readonly spellcheck="false"></textarea>
+    </section>
+
+    <!-- ===================== LOG ===================== -->
+    <section class="view view-block" id="view-log">
+      <div id="log-console"></div>
+    </section>
+  </main>
+</div>
+
+<div id="page-modal-backdrop">
+  <div id="page-modal">
+    <div class="modal-header">
+      <button class="ghost small nav-btn" id="modal-prev" aria-label="Previous page">&larr;</button>
+      <button class="ghost small nav-btn" id="modal-next" aria-label="Next page">&rarr;</button>
+      <span id="modal-page-label" style="font-family:var(--mono);font-size:12px;"></span>
+      <span class="page-type-badge" id="modal-badge"></span>
+      <div class="spacer"></div>
+      <button class="ghost small" id="modal-close" aria-label="Close">&times;</button>
+    </div>
+    <div class="modal-body">
+      <div class="modal-image-pane" id="modal-image-content"></div>
+      <div class="modal-text-pane" id="modal-text-content"></div>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+/* ==============================================================
+   Ledger — web UI
+
+   This is a view over the server, not the owner of any state. There is no
+   IndexedDB, no folder handle, no pdf.js and no worker loop here: the engine
+   owns all of it, so closing the browser does not stop a run and reopening it
+   shows exactly where things stand.
+
+   Every fetch goes through api() so error handling is in one place.
+   ============================================================== */
+
+const state = {
+  status: null,
+  books: [],
+  selectedBookId: null,
+  book: null,          // full detail of the selected book
+  lastEventId: 0,
+  modalPage: null,
+};
+
+/* ---------------- helpers ---------------- */
+
+function escapeHtml(value){
+  return String(value == null ? "" : value).replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+  }[c]));
+}
+
+let toastTimer = null;
+function toast(message, isError){
+  const el = document.getElementById("toast");
+  el.textContent = message;
+  el.className = "show" + (isError ? " err" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.className = ""; }, isError ? 6000 : 3000);
+}
+
+/**
+ * One place for every API call.
+ *
+ * FastAPI puts error text in `detail`, so surfacing that gives the real reason
+ * ("Set the Apps Script URL first") instead of a bare status code.
+ */
+async function api(path, options){
+  const response = await fetch(path, options);
+  if (!response.ok){
+    let message = "HTTP " + response.status;
+    try {
+      const body = await response.json();
+      if (body && body.detail) message = body.detail;
+    } catch (e) { /* non-JSON error body; keep the status */ }
+    throw new Error(message);
+  }
+  if (response.status === 204) return null;
+  return response.json();
+}
+
+async function post(path, body){
+  return api(path, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: body === undefined ? "{}" : JSON.stringify(body),
+  });
+}
+
+/* ---------------- header ---------------- */
+
+function renderHeader(){
+  const s = state.status;
+  if (!s) return;
+
+  document.getElementById("app-version").innerHTML =
+    "old&nbsp;book&nbsp;transcriber &middot; v" + escapeHtml(s.app_version)
+    + " &middot; " + escapeHtml(s.machine_id);
+
+  document.getElementById("stamp-used").textContent = s.capacity.used_today;
+  document.getElementById("stamp-cap").textContent =
+    s.capacity.used_today + s.capacity.remaining_today;
+
+  const days = document.getElementById("stamp-days");
+  days.textContent = s.days_remaining == null ? "—" : s.days_remaining;
+
+  const button = document.getElementById("btn-toggle-run");
+  button.textContent = s.running ? "Pause queue" : "Start queue";
+
+  // When every key is spent, saying so beats an unexplained idle button.
+  const quotaStamp = document.getElementById("stamp-quota");
+  quotaStamp.classList.toggle("muted", s.capacity.remaining_today === 0);
+}
+
+/* ---------------- books list ---------------- */
+
+function renderBooksList(){
+  document.getElementById("books-count").textContent = state.books.length;
+  const container = document.getElementById("books-list-body");
+
+  if (state.books.length === 0){
+    container.innerHTML =
+      '<div class="empty-state" style="padding:24px 14px;font-size:12.5px;">'
+      + 'No books yet. Point <code>LEDGER_PDF_ROOT</code> at your scans and press '
+      + '&ldquo;Rescan folder&rdquo;.</div>';
+    return;
+  }
+
+  container.innerHTML = state.books.map(book => {
+    const total = book.total_pages || 1;
+    const pct = n => (100 * n / total).toFixed(2) + "%";
+    const settled = book.pages_done + book.pages_flagged + book.pages_failed;
+
+    let dot = "queued";
+    if (book.pages_pending === 0 && settled > 0) dot = "done";
+    else if (book.pages_failed > 0) dot = "error";
+    else if (settled > 0) dot = "processing";
+
+    return '<div class="book-row' + (book.id === state.selectedBookId ? " selected" : "")
+      + '" data-id="' + book.id + '" role="button" tabindex="0">'
+      + '<div class="name"><span class="dot ' + dot + '"></span>' + escapeHtml(book.title) + '</div>'
+      + '<div class="meta"><span>' + settled + " / " + book.total_pages + ' pages</span>'
+      + '<span>' + (book.pages_flagged ? book.pages_flagged + " flagged" : "") + '</span></div>'
+      + '<div class="progress-bar">'
+      +   '<div class="done" style="width:' + pct(book.pages_done) + '"></div>'
+      +   '<div class="flagged" style="width:' + pct(book.pages_flagged) + '"></div>'
+      +   '<div class="failed" style="width:' + pct(book.pages_failed) + '"></div>'
+      + '</div></div>';
+  }).join("");
+
+  container.querySelectorAll(".book-row").forEach(row => {
+    const select = () => selectBook(Number(row.dataset.id));
+    row.onclick = select;
+    row.onkeydown = event => {
+      if (event.key === "Enter" || event.key === " "){ event.preventDefault(); select(); }
+    };
+  });
+}
+
+/* ---------------- book detail ---------------- */
+
+async function selectBook(bookId){
+  state.selectedBookId = bookId;
+  renderBooksList();
+  try {
+    state.book = await api("/api/books/" + bookId);
+  } catch (error) {
+    toast(error.message, true);
+    return;
+  }
+  renderBookDetail();
+}
+
+function renderProfile(profile){
+  if (!profile || Object.keys(profile).length === 0){
+    return '<div class="profile-box"><span class="hint">'
+      + 'Not profiled yet. Ledger reads a few text pages from after page '
+      + escapeHtml(state.status ? state.status.config.profile_start_after_page : 15)
+      + ' once, to learn the language, script and period before transcribing.'
+      + '</span></div>';
+  }
+
+  const rows = [
+    ["Language", profile.primary_language],
+    ["Also present", (profile.other_languages || []).join(", ")],
+    ["Script", profile.script],
+    ["Period", profile.era],
+    ["Type", profile.typeface],
+    ["Conventions", profile.orthographic_notes],
+    ["Printed title", profile.title_as_printed],
+    ["Sampled from", (profile._sample_pages || []).length
+      ? "pages " + profile._sample_pages.join(", ") + " (" + profile._sample_strategy + ")"
+      : ""],
+  ].filter(([, value]) => value);
+
+  return '<div class="profile-box"><dl>'
+    + rows.map(([label, value]) =>
+        "<dt>" + escapeHtml(label) + "</dt><dd>" + escapeHtml(value) + "</dd>").join("")
+    + "</dl></div>";
+}
+
+function renderBookDetail(){
+  const container = document.getElementById("book-detail");
+  const book = state.book;
+
+  if (!book){
+    container.innerHTML = '<div class="empty-state">Select a book to see its pages.</div>';
+    return;
+  }
+
+  const counts = {pending:0, in_progress:0, done:0, flagged:0, failed:0};
+  book.pages.forEach(page => { counts[page.status] = (counts[page.status] || 0) + 1; });
+
+  container.innerHTML =
+      "<h2>" + escapeHtml(book.title) + "</h2>"
+    + '<div class="sub">' + escapeHtml(book.rel_path) + " &middot; " + book.total_pages + " pages</div>"
+    + renderProfile(book.profile)
+    + '<div style="margin:14px 0;display:flex;gap:8px;flex-wrap:wrap;">'
+    +   '<button class="ghost small" id="btn-publish-book">Publish this book</button>'
+    +   '<button class="ghost small" id="btn-requeue-book">Retry flagged &amp; failed</button>'
+    +   '<button class="danger-outline small" id="btn-remove-book">Remove from Ledger</button>'
+    + "</div>"
+    + '<div class="legend">'
+    +   '<span><i style="background:var(--rule)"></i>pending ' + counts.pending + "</span>"
+    +   '<span><i style="background:var(--link)"></i>in progress ' + counts.in_progress + "</span>"
+    +   '<span><i style="background:var(--success)"></i>done ' + counts.done + "</span>"
+    +   '<span><i style="background:var(--warn)"></i>flagged ' + counts.flagged + "</span>"
+    +   '<span><i style="background:var(--danger)"></i>failed ' + counts.failed + "</span>"
+    + "</div>"
+    + '<div class="page-grid">'
+    + book.pages.map(page =>
+        '<button class="page-cell ' + page.status
+        + '" data-page-no="' + page.page_no + '" title="Page ' + page.page_no
+        + " — " + page.status + '">' + page.page_no + "</button>").join("")
+    + "</div>";
+
+  container.querySelectorAll(".page-cell").forEach(cell => {
+    cell.onclick = () => openModal(Number(cell.dataset.pageNo));
+  });
+
+  document.getElementById("btn-publish-book").onclick = () => publish(book.id);
+  document.getElementById("btn-requeue-book").onclick = async () => {
+    try {
+      const result = await post("/api/books/" + book.id + "/requeue",
+                                {flagged: true, failed: true});
+      toast("Returned " + result.requeued + " page(s) to the queue.");
+      await selectBook(book.id);
+    } catch (error) { toast(error.message, true); }
+  };
+  document.getElementById("btn-remove-book").onclick = async () => {
+    if (!confirm("Remove “" + book.title + "” and its transcriptions from Ledger?\n\n"
+                 + "The PDF on disk is untouched, and a rescan will pick it up again "
+                 + "as a new book with no progress.")) return;
+    try {
+      await api("/api/books/" + book.id, {method: "DELETE"});
+      state.selectedBookId = null;
+      state.book = null;
+      toast("Book removed.");
+      await refresh();
+      renderBookDetail();
+    } catch (error) { toast(error.message, true); }
+  };
+}
+
+/* ---------------- page modal ---------------- */
+
+function openModal(pageNo){
+  state.modalPage = pageNo;
+  document.getElementById("page-modal-backdrop").classList.add("open");
+  renderModal();
+}
+
+function closeModal(){
+  document.getElementById("page-modal-backdrop").classList.remove("open");
+  state.modalPage = null;
+  document.getElementById("modal-image-content").innerHTML = "";
+}
+
+function stepModal(delta){
+  if (state.modalPage == null || !state.book) return;
+  const next = state.modalPage + delta;
+  if (next < 1 || next > state.book.total_pages) return;
+  state.modalPage = next;
+  renderModal();
+}
+
+function renderModal(){
+  const book = state.book;
+  const pageNo = state.modalPage;
+  if (!book || pageNo == null) return;
+
+  const page = book.pages.find(p => p.page_no === pageNo) || {status: "pending"};
+
+  document.getElementById("modal-page-label").textContent =
+    "p. " + pageNo + " of " + book.total_pages;
+
+  const badge = document.getElementById("modal-badge");
+  badge.textContent = page.page_type || page.status;
+  const colours = {
+    done: "var(--success)", flagged: "var(--warn)",
+    failed: "var(--danger)", pending: "var(--rule)", in_progress: "var(--link)",
+  };
+  badge.style.background = colours[page.status] || "var(--rule)";
+  badge.style.color = page.status === "pending" ? "var(--ink-soft)" : "#fff";
+
+  // The scan is rendered server-side on demand. No pdf.js, and nothing from
+  // the source corpus is ever copied into browser storage.
+  document.getElementById("modal-image-content").innerHTML =
+    '<img alt="Page ' + pageNo + ' of ' + escapeHtml(book.title) + '" src="/api/books/'
+    + book.id + "/pages/" + pageNo + '/image?dpi=110">';
+
+  const textPane = document.getElementById("modal-text-content");
+  let html = "";
+
+  if (page.status === "pending"){
+    html += '<p class="placeholder">Not transcribed yet.</p>';
+  } else if (page.status === "failed"){
+    html += '<p class="placeholder">Gave up after ' + page.attempts
+         + ' attempt(s).</p><div class="provenance">' + escapeHtml(page.last_error) + "</div>";
+  } else {
+    if (page.flag_reason){
+      html += '<p class="placeholder" style="color:var(--warn);">Flagged: '
+           + escapeHtml(page.flag_reason) + "</p>";
+    }
+    if (page.printed_page_number){
+      html += '<div class="provenance">Printed page number: '
+           + escapeHtml(page.printed_page_number) + "</div>";
+    }
+    if (page.transcription){
+      html += '<p class="transcription">' + escapeHtml(page.transcription) + "</p>";
+    } else {
+      html += '<p class="placeholder">No body text on this page ('
+           + escapeHtml(page.page_type || "") + ").</p>";
+    }
+    if (page.footnotes){
+      html += "<h4>Footnotes</h4>"
+           + '<p class="transcription" style="font-size:13px;">'
+           + escapeHtml(page.footnotes) + "</p>";
+    }
+    if (page.note){
+      html += "<h4>Note</h4><div class=\"provenance\">" + escapeHtml(page.note) + "</div>";
+    }
+    html += "<h4>How this was produced</h4><div class=\"provenance\">"
+         + escapeHtml(page.model) + " &middot; " + escapeHtml(page.media_resolution)
+         + " &middot; " + page.render_dpi + " DPI<br>"
+         + "key " + escapeHtml(page.key_label) + " &middot; "
+         + page.input_tokens + " in / " + page.output_tokens + " out tokens<br>"
+         + page.latency_ms + " ms</div>";
+  }
+
+  textPane.innerHTML = html;
+}
+
+/* ---------------- keys ---------------- */
+
+function renderKeys(){
+  const keys = state.keys || [];
+  const body = document.getElementById("keys-body");
+
+  if (keys.length === 0){
+    body.innerHTML = '<tr><td colspan="8" class="hint" style="padding:18px 8px;">'
+      + "No keys yet. Add one below, or import a file with "
+      + "<code>ledger keys import keys.json</code>.</td></tr>";
+    return;
+  }
+
+  body.innerHTML = keys.map(key => {
+    const canRevive = key.state === "dead" || key.state === "exhausted";
+    return "<tr>"
+      + "<td>" + escapeHtml(key.label) + "</td>"
+      + '<td class="usage-mini">…' + escapeHtml(key.secret_tail) + "</td>"
+      + '<td><span class="key-state ' + key.state + '">' + key.state + "</span></td>"
+      + '<td class="usage-mini">' + key.used_today + " / " + key.rpd_limit
+      +   (key.cooldown_seconds ? "<br>wait " + key.cooldown_seconds + "s" : "") + "</td>"
+      + '<td class="usage-mini">' + (key.rpm_limit || "—") + "</td>"
+      + '<td class="usage-mini">' + key.rpd_limit + "</td>"
+      + '<td class="usage-mini">' + escapeHtml(key.last_error) + "</td>"
+      + "<td>"
+      +   (canRevive ? '<button class="ghost small" data-revive="' + escapeHtml(key.label) + '">Revive</button> ' : "")
+      +   '<button class="danger-outline small" data-remove="' + escapeHtml(key.label) + '">&times;</button>'
+      + "</td></tr>";
+  }).join("");
+
+  body.querySelectorAll("[data-revive]").forEach(button => {
+    button.onclick = async () => {
+      try {
+        await post("/api/keys/" + encodeURIComponent(button.dataset.revive) + "/revive");
+        toast("Key returned to service.");
+        await refresh();
+      } catch (error) { toast(error.message, true); }
+    };
+  });
+
+  body.querySelectorAll("[data-remove]").forEach(button => {
+    button.onclick = async () => {
+      const label = button.dataset.remove;
+      if (!confirm("Remove key “" + label + "”?")) return;
+      try {
+        await api("/api/keys/" + encodeURIComponent(label), {method: "DELETE"});
+        toast("Key removed.");
+        await refresh();
+      } catch (error) { toast(error.message, true); }
+    };
+  });
+}
+
+/* ---------------- settings ---------------- */
+
+function renderConfig(){
+  const config = state.status && state.status.config;
+  if (!config) return;
+
+  const rows = [
+    ["PDF folder", config.pdf_root],
+    ["Database", config.db_path],
+    ["Export folder", config.export_dir],
+    ["Model", config.model],
+    ["Visual detail", config.media_resolution],
+    ["Render", config.dpi + " DPI " + config.image_format
+      + (config.greyscale ? ", greyscale" : "") + (config.deskew ? ", deskewed" : "")],
+    ["Thinking", config.thinking_level || "off"],
+    ["Line breaks", config.preserve_layout ? "preserved" : "reflowed"],
+    ["Book profiling", config.profile_books
+      ? "on, from after page " + config.profile_start_after_page : "off"],
+    ["Max workers", config.max_workers],
+  ];
+
+  document.getElementById("config-readonly").innerHTML = rows.map(
+    ([label, value]) => "<dt>" + escapeHtml(label) + "</dt><dd>" + escapeHtml(value) + "</dd>"
+  ).join("");
+}
+
+function renderPublish(){
+  const publish = (state.status && state.status.publish) || {state: "idle"};
+  const pill = document.getElementById("publish-pill");
+  const cancel = document.getElementById("btn-publish-cancel");
+
+  const labels = {
+    idle: ["Idle", "no"],
+    running: ["Publishing…", "warn"],
+    done: ["Published", "ok"],
+    failed: ["Failed", "err"],
+    cancelled: ["Cancelled", "no"],
+  };
+  const [label, cls] = labels[publish.state] || ["Idle", "no"];
+
+  let text = label;
+  if (publish.state === "running"){
+    text = "Publishing " + publish.books_done + "/" + publish.books_total
+         + (publish.current_book ? " — " + publish.current_book : "");
+  } else if (publish.state === "done"){
+    text = "Published " + publish.pages_written + " page(s) in " + publish.elapsed + "s";
+  } else if (publish.state === "failed"){
+    text = "Failed: " + publish.error;
+  }
+
+  pill.textContent = text;
+  pill.className = "status-pill " + cls;
+  cancel.style.display = publish.state === "running" ? "inline-block" : "none";
+}
+
+async function publish(bookId){
+  try {
+    await post("/api/sheets/publish", {book_id: bookId == null ? null : bookId});
+    toast("Publishing started.");
+    await refresh();
+  } catch (error) { toast(error.message, true); }
+}
+
+/* ---------------- log ---------------- */
+
+async function pollEvents(){
+  let events;
+  try {
+    events = await api("/api/events?after_id=" + state.lastEventId);
+  } catch (error) { return; }
+
+  if (!events.length) return;
+
+  const console_ = document.getElementById("log-console");
+  const atBottom = console_.scrollHeight - console_.scrollTop - console_.clientHeight < 40;
+
+  events.forEach(event => {
+    state.lastEventId = Math.max(state.lastEventId, event.id);
+    const line = document.createElement("div");
+    line.className = "line l-" + event.level;
+    const time = new Date(event.ts * 1000).toLocaleTimeString();
+    line.textContent = "[" + time + "] " + event.message;
+    console_.appendChild(line);
+  });
+
+  // Only autoscroll if the reader was already at the bottom, so scrolling back
+  // to read something is not yanked away on the next poll.
+  if (atBottom) console_.scrollTop = console_.scrollHeight;
+
+  // Keep the console bounded; the durable record is the database.
+  while (console_.childElementCount > 2000) console_.removeChild(console_.firstChild);
+}
+
+/* ---------------- refresh loop ---------------- */
+
+async function refresh(){
+  try {
+    const [status, books, keys] = await Promise.all([
+      api("/api/status"),
+      api("/api/books"),
+      api("/api/keys"),
+    ]);
+    state.status = status;
+    state.books = books;
+    state.keys = keys;
+  } catch (error) {
+    toast("Lost contact with the server: " + error.message, true);
+    return;
+  }
+
+  renderHeader();
+  renderBooksList();
+  renderKeys();
+  renderConfig();
+  renderPublish();
+
+  // Refresh the open book so page colours track the run without a click.
+  if (state.selectedBookId != null){
+    try {
+      state.book = await api("/api/books/" + state.selectedBookId);
+      renderBookDetail();
+      if (state.modalPage != null) renderModal();
+    } catch (error) { /* book may have been removed; the list will catch up */ }
+  }
+}
+
+/* ---------------- wiring ---------------- */
+
+async function init(){
+  document.querySelectorAll(".tab-btn").forEach(button => {
+    button.onclick = () => {
+      document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
+      button.classList.add("active");
+      document.querySelectorAll("section.view").forEach(s => s.classList.remove("active"));
+      document.getElementById("view-" + button.dataset.view).classList.add("active");
+    };
+  });
+
+  document.getElementById("btn-toggle-run").onclick = async () => {
+    const running = state.status && state.status.running;
+    try {
+      await post(running ? "/api/run/stop" : "/api/run/start");
+      toast(running ? "Pausing — workers finish their current page." : "Queue started.");
+      await refresh();
+    } catch (error) { toast(error.message, true); }
+  };
+
+  document.getElementById("btn-rescan").onclick = async () => {
+    try {
+      const result = await post("/api/scan");
+      toast("Found " + result.found + " PDF(s): " + result.added + " new, "
+            + result.pages_added + " page(s) queued.");
+      await refresh();
+    } catch (error) { toast(error.message, true); }
+  };
+
+  document.getElementById("btn-publish-all").onclick = () => publish(null);
+  document.getElementById("btn-publish-settings").onclick = () => publish(null);
+  document.getElementById("btn-publish-cancel").onclick = async () => {
+    await post("/api/sheets/publish/cancel");
+    toast("Cancelling after the current chunk.");
+  };
+
+  document.getElementById("btn-save-key").onclick = async () => {
+    const label = document.getElementById("new-key-label").value.trim();
+    const secret = document.getElementById("new-key-secret").value.trim();
+    if (!label || !secret){ toast("Both a label and a key are needed.", true); return; }
+    try {
+      await post("/api/keys", {
+        label,
+        secret,
+        rpm_limit: Number(document.getElementById("new-key-rpm").value),
+        rpd_limit: Number(document.getElementById("new-key-rpd").value),
+      });
+      document.getElementById("new-key-secret").value = "";
+      document.getElementById("new-key-label").value = "";
+      toast("Key saved.");
+      await refresh();
+    } catch (error) { toast(error.message, true); }
+  };
+
+  document.getElementById("btn-save-sheets").onclick = async () => {
+    try {
+      await api("/api/settings", {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          sheets_url: document.getElementById("set-sheets-url").value.trim(),
+          sheets_secret: document.getElementById("set-sheets-secret").value,
+        }),
+      });
+      document.getElementById("set-sheets-secret").value = "";
+      toast("Saved.");
+      await loadSettings();
+    } catch (error) { toast(error.message, true); }
+  };
+
+  document.getElementById("btn-test-sheets").onclick = async () => {
+    const pill = document.getElementById("sheets-pill");
+    pill.textContent = "Testing…";
+    pill.className = "status-pill no";
+    try {
+      const result = await post("/api/sheets/test");
+      if (result.up_to_date){
+        pill.textContent = "Connected (v" + result.deployed_version + ")";
+        pill.className = "status-pill ok";
+      } else {
+        pill.textContent = "Connected, but the deployment is v"
+          + result.deployed_version + " and this build expects v"
+          + result.expected_version;
+        pill.className = "status-pill warn";
+      }
+    } catch (error) {
+      pill.textContent = error.message;
+      pill.className = "status-pill err";
+    }
+  };
+
+  document.getElementById("btn-export").onclick = async () => {
+    try {
+      const result = await post("/api/export");
+      toast("Exported " + result.book_count + " book(s) to " + result.export_dir);
+    } catch (error) { toast(error.message, true); }
+  };
+
+  document.getElementById("btn-download-index").onclick = () => {
+    window.location.href = "/api/export/download";
+  };
+
+  document.getElementById("btn-requeue-all").onclick = async () => {
+    try {
+      const result = await post("/api/requeue", {
+        flagged: document.getElementById("requeue-flagged").checked,
+        failed: document.getElementById("requeue-failed").checked,
+      });
+      toast("Returned " + result.requeued + " page(s) to the queue.");
+      await refresh();
+    } catch (error) { toast(error.message, true); }
+  };
+
+  // Modal controls.
+  document.getElementById("modal-close").onclick = closeModal;
+  document.getElementById("modal-prev").onclick = () => stepModal(-1);
+  document.getElementById("modal-next").onclick = () => stepModal(1);
+  document.getElementById("page-modal-backdrop").onclick = event => {
+    if (event.target.id === "page-modal-backdrop") closeModal();
+  };
+  document.addEventListener("keydown", event => {
+    if (state.modalPage == null) return;
+    if (event.key === "Escape") closeModal();
+    if (event.key === "ArrowLeft") stepModal(-1);
+    if (event.key === "ArrowRight") stepModal(1);
+  });
+
+  // Apps Script source, served by the app so the instructions and the code can
+  // never drift apart.
+  try {
+    const script = await api("/api/appsscript");
+    document.getElementById("codegs-source").value = script.code;
+    document.getElementById("script-version").textContent = "(v" + script.version + ")";
+
+    document.getElementById("btn-copy-script").onclick = async () => {
+      const textarea = document.getElementById("codegs-source");
+      try {
+        await navigator.clipboard.writeText(textarea.value);
+      } catch (error) {
+        // Clipboard API needs a secure context; selecting the text is a
+        // reliable fallback over plain http on a LAN.
+        textarea.focus(); textarea.select();
+      }
+      toast("Script copied. Paste it into Apps Script, replacing everything.");
+    };
+
+    document.getElementById("btn-download-script").onclick = () => {
+      const blob = new Blob([script.code], {type: "text/plain"});
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "Code.gs";
+      link.click();
+      URL.revokeObjectURL(link.href);
+    };
+  } catch (error) { /* setup tab simply stays empty */ }
+
+  await loadSettings();
+  await refresh();
+  await pollEvents();
+
+  // Two loops at different rates: status is cheap and wanted often, the log
+  // tail even more so.
+  setInterval(refresh, 3000);
+  setInterval(pollEvents, 2000);
+}
+
+async function loadSettings(){
+  try {
+    const settings = await api("/api/settings");
+    document.getElementById("set-sheets-url").value = settings.sheets_url || "";
+    document.getElementById("set-sheets-secret").placeholder = settings.sheets_secret_set
+      ? "a secret is saved — leave blank to keep it"
+      : "optional, but recommended";
+  } catch (error) { /* leave the fields empty */ }
+}
+
+init();
+</script>
+</body>
+</html>

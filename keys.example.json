@@ -1,0 +1,14 @@
+[
+  {
+    "label": "acct-01",
+    "secret": "PASTE_KEY_FROM_ACCOUNT_1_HERE",
+    "rpm_limit": 10,
+    "rpd_limit": 250
+  },
+  {
+    "label": "acct-02",
+    "secret": "PASTE_KEY_FROM_ACCOUNT_2_HERE",
+    "rpm_limit": 10,
+    "rpd_limit": 250
+  }
+]
