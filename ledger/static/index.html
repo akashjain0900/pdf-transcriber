@@ -197,6 +197,12 @@
   .key-state.exhausted{ background:var(--warn); color:#fff; }
   .key-state.cooldown{ background:var(--link); color:#fff; }
   .key-state.dead{ background:var(--danger); color:#fff; }
+  .key-inplay{ font-family:var(--mono); font-size:10px; padding:1px 6px; border-radius:20px;
+    background:var(--accent); color:var(--accent-ink); }
+  tr.key-off{ opacity:0.45; }
+  tr.key-dirty td{ background:#EFE6CE; }
+  table.keys input[type=number]{ width:70px; }
+  table.keys input[type=checkbox]{ width:16px; height:16px; cursor:pointer; }
 
   /* --- Settings view --- */
   #view-settings{ padding:20px 26px; max-width:760px; }
@@ -306,17 +312,31 @@
         high, Ledger learns the real ceiling from repeated refusals and corrects itself.
         Counters reset at midnight <b>US&nbsp;Pacific</b>, which is when Google resets them.
       </p>
+      <p class="hint" style="max-width:760px;">
+        <b id="key-window-note">At most 5 keys are used at a time.</b> Ticked keys enter
+        in the order listed; when one runs out for the day the next ticked key takes its
+        place automatically. Rows in play are marked <span class="key-inplay">in play</span>.
+        Untick a key to take it out of rotation entirely.
+      </p>
+
+      <div class="field-row" style="margin-bottom:14px;">
+        <label style="width:auto;">Import a keys.json file</label>
+        <input type="file" id="keys-file" accept=".json,application/json"
+               style="flex:0 0 auto;font-size:12.5px;">
+        <span class="hint" id="keys-file-hint" style="margin:0;"></span>
+      </div>
 
       <table class="keys">
         <thead><tr>
-          <th style="width:16%">Label</th>
-          <th style="width:10%">Key</th>
-          <th style="width:11%">State</th>
-          <th style="width:14%">Used today</th>
+          <th style="width:6%">Use</th>
+          <th style="width:15%">Label</th>
+          <th style="width:8%">Key</th>
+          <th style="width:12%">State</th>
+          <th style="width:11%">Used today</th>
           <th style="width:9%">Per min</th>
           <th style="width:9%">Per day</th>
           <th>Note</th>
-          <th style="width:8%"></th>
+          <th style="width:12%"></th>
         </tr></thead>
         <tbody id="keys-body"></tbody>
       </table>
@@ -801,29 +821,87 @@ function renderKeys(){
   const keys = state.keys || [];
   const body = document.getElementById("keys-body");
 
+  const capacity = state.status && state.status.capacity;
+  if (capacity){
+    document.getElementById("key-window-note").textContent =
+      "At most " + capacity.max_concurrent_keys + " keys are used at a time"
+      + " (" + capacity.keys_in_use + " in play now).";
+  }
+
   if (keys.length === 0){
-    body.innerHTML = '<tr><td colspan="8" class="hint" style="padding:18px 8px;">'
-      + "No keys yet. Add one below, or import a file with "
-      + "<code>ledger keys import keys.json</code>.</td></tr>";
+    body.innerHTML = '<tr><td colspan="9" class="hint" style="padding:18px 8px;">'
+      + "No keys yet. Import a keys.json file above, or add one below.</td></tr>";
     return;
   }
 
   body.innerHTML = keys.map(key => {
     const canRevive = key.state === "dead" || key.state === "exhausted";
-    return "<tr>"
-      + "<td>" + escapeHtml(key.label) + "</td>"
+    const label = escapeHtml(key.label);
+    return '<tr data-label="' + label + '"'
+      + (key.enabled ? "" : ' class="key-off"') + ">"
+      + '<td><input type="checkbox" data-field="enabled"' + (key.enabled ? " checked" : "")
+      +   ' aria-label="Use ' + label + '"></td>'
+      + "<td>" + label
+      +   (key.in_use ? ' <span class="key-inplay">in play</span>' : "") + "</td>"
       + '<td class="usage-mini">…' + escapeHtml(key.secret_tail) + "</td>"
       + '<td><span class="key-state ' + key.state + '">' + key.state + "</span></td>"
       + '<td class="usage-mini">' + key.used_today + " / " + key.rpd_limit
       +   (key.cooldown_seconds ? "<br>wait " + key.cooldown_seconds + "s" : "") + "</td>"
-      + '<td class="usage-mini">' + (key.rpm_limit || "—") + "</td>"
-      + '<td class="usage-mini">' + key.rpd_limit + "</td>"
+      + '<td><input type="number" min="0" data-field="rpm_limit" value="' + key.rpm_limit + '"></td>'
+      + '<td><input type="number" min="1" data-field="rpd_limit" value="' + key.rpd_limit + '"></td>'
       + '<td class="usage-mini">' + escapeHtml(key.last_error) + "</td>"
       + "<td>"
-      +   (canRevive ? '<button class="ghost small" data-revive="' + escapeHtml(key.label) + '">Revive</button> ' : "")
-      +   '<button class="danger-outline small" data-remove="' + escapeHtml(key.label) + '">&times;</button>'
+      +   '<button class="primary small" data-save="' + label + '" disabled>Save</button> '
+      +   (canRevive ? '<button class="ghost small" data-revive="' + label + '">Revive</button> ' : "")
+      +   '<button class="danger-outline small" data-remove="' + label + '">&times;</button>'
       + "</td></tr>";
   }).join("");
+
+  // Editing any field in a row arms that row's Save button. Nothing is sent
+  // until Save is pressed, so a half-typed number is never applied — which
+  // matters when a stray keystroke could set a daily limit to 3.
+  body.querySelectorAll("tr[data-label]").forEach(row => {
+    const saveButton = row.querySelector("[data-save]");
+
+    row.querySelectorAll("[data-field]").forEach(input => {
+      input.oninput = () => {
+        saveButton.disabled = false;
+        row.classList.add("key-dirty");
+      };
+      input.onchange = () => {
+        saveButton.disabled = false;
+        row.classList.add("key-dirty");
+      };
+      // Enter saves, so the row can be edited without reaching for the mouse.
+      input.onkeydown = event => {
+        if (event.key === "Enter" && !saveButton.disabled) saveButton.click();
+      };
+    });
+
+    saveButton.onclick = async () => {
+      const values = {};
+      row.querySelectorAll("[data-field]").forEach(input => {
+        values[input.dataset.field] = input.type === "checkbox"
+          ? input.checked
+          : Number(input.value);
+      });
+
+      saveButton.disabled = true;
+      try {
+        await api("/api/keys/" + encodeURIComponent(row.dataset.label), {
+          method: "PUT",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify(values),
+        });
+        row.classList.remove("key-dirty");
+        toast("Saved " + row.dataset.label + ".");
+        await refresh();
+      } catch (error) {
+        saveButton.disabled = false;
+        toast(error.message, true);
+      }
+    };
+  });
 
   body.querySelectorAll("[data-revive]").forEach(button => {
     button.onclick = async () => {
@@ -960,7 +1038,10 @@ async function refresh(){
 
   renderHeader();
   renderBooksList();
-  renderKeys();
+
+  // Skip the keys table while a row has unsaved edits, so the periodic refresh
+  // does not wipe out what is being typed.
+  if (!document.querySelector("#keys-body tr.key-dirty")) renderKeys();
   renderConfig();
   renderPublish();
 
@@ -1009,6 +1090,48 @@ async function init(){
   document.getElementById("btn-publish-cancel").onclick = async () => {
     await post("/api/sheets/publish/cancel");
     toast("Cancelling after the current chunk.");
+  };
+
+  document.getElementById("keys-file").onchange = async event => {
+    const file = event.target.files && event.target.files[0];
+    const hint = document.getElementById("keys-file-hint");
+    if (!file) return;
+
+    hint.textContent = "Reading " + file.name + "…";
+
+    // The file is parsed here and posted as JSON, so the server needs no
+    // multipart handling and the file itself never leaves the browser.
+    let parsed;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch (error) {
+      hint.textContent = "";
+      toast("That file is not valid JSON: " + error.message, true);
+      event.target.value = "";
+      return;
+    }
+
+    // Accept either a bare array or {"keys": [...]}.
+    const list = Array.isArray(parsed) ? parsed : parsed.keys;
+    if (!Array.isArray(list)){
+      hint.textContent = "";
+      toast('Expected a list of keys, or {"keys": [...]}.', true);
+      event.target.value = "";
+      return;
+    }
+
+    try {
+      const result = await post("/api/keys/import", {keys: list});
+      hint.textContent = "";
+      let message = "Imported " + result.imported + " key(s).";
+      if (result.skipped.length) message += " Skipped " + result.skipped.length + ".";
+      toast(message);
+      await refresh();
+    } catch (error) {
+      hint.textContent = "";
+      toast(error.message, true);
+    }
+    event.target.value = "";
   };
 
   document.getElementById("btn-save-key").onclick = async () => {

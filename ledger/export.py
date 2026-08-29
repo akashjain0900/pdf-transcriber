@@ -9,13 +9,19 @@ A 450-page book is 450 lines you can grep, stream, tail, or append to, and a
 truncated file still parses line by line up to the break. A single top-level
 array has none of those properties and has to be held in memory whole.
 
-Each book produces two files:
+Each book produces three files, all named after the PDF — `010.pdf` gives
+`010.txt`, `010.jsonl` and `010.manifest.json`:
 
-    <book>.jsonl      one line per page, full detail
+    <book>.txt             the transcription as plain readable text
+    <book>.jsonl           one line of JSON per page, with everything recorded
     <book>.manifest.json   book-level metadata and page-status counts
 
-Plus one index.json across the whole export, which is what the Sheets upload
-step reads.
+Plus one index.json across the whole export.
+
+The .txt is the one to read. The .jsonl is the one to process: JSON Lines is one
+self-contained JSON object per line rather than a single array, which means it
+can be appended to, streamed, and read line by line — and a file cut short still
+parses up to the break, where a truncated array parses not at all.
 
 The provenance block on every page is the part that will matter in three years,
 when someone asks which model produced a passage and at what settings. It costs
@@ -28,6 +34,26 @@ import json
 from pathlib import Path
 
 from .config import APP_VERSION
+
+
+def build_file_stems(books) -> dict:
+    """
+    One filename stem per book, keyed by book id — the PDF's own name.
+
+    Two PDFs in different folders can share a filename but two files in the
+    export folder cannot, so the id is appended to duplicates only. In the
+    normal case the export is just `010.jsonl`.
+    """
+    cleaned = {int(b["id"]): _safe_filename(b["title"]) for b in books}
+
+    counts: dict[str, int] = {}
+    for stem in cleaned.values():
+        counts[stem] = counts.get(stem, 0) + 1
+
+    return {
+        book_id: stem if counts[stem] == 1 else f"{stem}_{book_id}"
+        for book_id, stem in cleaned.items()
+    }
 
 
 def _safe_filename(name: str) -> str:
@@ -100,7 +126,45 @@ def _page_to_record(row, book_row) -> dict:
     }
 
 
-def export_book(database, book_id: int, out_dir: Path) -> dict:
+def write_plain_text(book_row, page_rows, path: Path) -> None:
+    """
+    Write the book as plain readable text.
+
+    Page breaks are marked so a passage can still be traced back to its PDF
+    page, and pages with no text say what they were rather than appearing as an
+    unexplained gap.
+    """
+    lines = [
+        book_row["title"],
+        "=" * len(book_row["title"]),
+        f"Source: {book_row['rel_path']}",
+        f"{book_row['total_pages']} pages",
+        "",
+    ]
+
+    for row in page_rows:
+        lines.append("")
+        lines.append(f"--- PDF page {row['page_no']} ---")
+
+        if row["status"] not in ("done", "flagged"):
+            lines.append(f"[not transcribed: {row['status']}]")
+            continue
+
+        text = (row["transcription"] or "").strip()
+        if text:
+            lines.append(text)
+        else:
+            lines.append(f"[{(row['page_type'] or 'no text').upper()}]")
+
+        if row["footnotes"]:
+            lines.append("")
+            lines.append("[Footnotes]")
+            lines.append(row["footnotes"].strip())
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def export_book(database, book_id: int, out_dir: Path, stem: str | None = None) -> dict:
     """
     Write one book's JSONL and manifest. Returns the manifest dict.
 
@@ -118,9 +182,12 @@ def export_book(database, book_id: int, out_dir: Path) -> dict:
 
     page_rows = database.pages_for_book(book_id)
 
-    stem = f"{book_id:04d}_{_safe_filename(book_row['title'])}"
+    if stem is None:
+        stem = _safe_filename(book_row["title"])
+
     jsonl_path = out_dir / f"{stem}.jsonl"
     manifest_path = out_dir / f"{stem}.manifest.json"
+    text_path = out_dir / f"{stem}.txt"
 
     counts: dict[str, int] = {}
     total_input_tokens = 0
@@ -139,6 +206,8 @@ def export_book(database, book_id: int, out_dir: Path) -> dict:
             # them to \uXXXX makes the file unreadable to a human reviewer.
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
+    write_plain_text(book_row, page_rows, text_path)
+
     manifest = {
         "book_id": int(book_row["id"]),
         "title": book_row["title"],
@@ -154,6 +223,7 @@ def export_book(database, book_id: int, out_dir: Path) -> dict:
             "output": total_output_tokens,
         },
         "transcriptions_file": jsonl_path.name,
+        "plain_text_file": text_path.name,
         "exported_by_app_version": APP_VERSION,
     }
 
@@ -176,9 +246,15 @@ def export_all(config, database, log=print) -> dict:
     out_dir = Path(config.export_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    books = database.list_books()
+    stems = build_file_stems(books)
+
     manifests = []
-    for book_row in database.list_books():
-        manifest = export_book(database, int(book_row["id"]), out_dir)
+    for book_row in books:
+        book_id = int(book_row["id"])
+        manifest = export_book(
+            database, book_id, out_dir, stem=stems[book_id]
+        )
         manifests.append(manifest)
         log(
             f"Exported “{manifest['title']}” "

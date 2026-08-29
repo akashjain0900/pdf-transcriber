@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 # setuptools import the package during the build, which fails on some
 # setuptools versions with "No module named 'ledger'". Bump this alongside
 # APP_VERSION in ledger/config.py.
-version = "0.4.1"
+version = "0.5.1"
 
 dependencies = [
     # PDF rendering. Import as `pymupdf`; the old `fitz` name is deprecated

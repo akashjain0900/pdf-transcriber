@@ -59,6 +59,18 @@ except ZoneInfoNotFoundError as exc:  # pragma: no cover - platform dependent
     ) from exc
 
 
+# How many keys may be in play at once.
+#
+# With a large pool it is better to work a small set hard and bring in a
+# replacement as each one is spent, rather than spread every request thinly
+# across all of them. Keys enter the window in id order, so the set is
+# predictable; when one exhausts for the day, the next enabled key takes its
+# place automatically.
+#
+# Fewer keys than this is not a problem — the window is a ceiling, not a target.
+MAX_CONCURRENT_KEYS = 5
+
+
 # Key states.
 STATE_ACTIVE = "active"
 STATE_COOLDOWN = "cooldown"
@@ -154,6 +166,11 @@ class ApiKey:
 
     state: str = STATE_ACTIVE
 
+    # Whether this key may be used at all. Set from the UI checkbox. A disabled
+    # key is skipped entirely and does not occupy a slot in the concurrency
+    # window, so disabling one promotes the next key in line.
+    enabled: bool = True
+
     # The Pacific date `used_today` refers to. When today's Pacific date
     # differs from this, the counter is stale and gets reset.
     used_on: str = ""
@@ -217,6 +234,9 @@ class ApiKey:
         A return value in the past means "usable right now".
         """
         now = now if now is not None else time.time()
+
+        if not self.enabled:
+            return None
 
         if self.state in (STATE_DEAD, STATE_EXHAUSTED):
             return None
@@ -290,6 +310,30 @@ class KeyPool:
             if changed:
                 self._persist(key)
 
+    def _working_set(self) -> list[ApiKey]:
+        """
+        The keys currently allowed in play, at most MAX_CONCURRENT_KEYS of them.
+
+        Eligibility is "could be used today at all": enabled, not dead, and not
+        already spent. A key merely cooling down for a few seconds stays in the
+        window and keeps its slot, because pulling in a replacement for a
+        momentary throttle would leave more keys in play than intended.
+
+        Order is key id, so the window is predictable and the same keys are
+        worked first every day. As each one exhausts it drops out and the next
+        enabled key moves in with no intervention.
+
+        Always called with the lock held.
+        """
+        eligible = [
+            key for key in self._keys
+            if key.enabled
+            and key.state != STATE_DEAD
+            and key.state != STATE_EXHAUSTED
+            and key.remaining_today > 0
+        ]
+        return eligible[:MAX_CONCURRENT_KEYS]
+
     # -----------------------------------------------------------------
     # Public interface
     # -----------------------------------------------------------------
@@ -310,7 +354,7 @@ class KeyPool:
             self._expire_cooldowns(now, today)
 
             ready: list[ApiKey] = []
-            for key in self._keys:
+            for key in self._working_set():
                 earliest = key.available_at(now)
                 if earliest is not None and earliest <= now:
                     ready.append(key)
@@ -340,7 +384,7 @@ class KeyPool:
             self._expire_cooldowns(now, today)
 
             waits = []
-            for key in self._keys:
+            for key in self._working_set():
                 earliest = key.available_at(now)
                 if earliest is not None:
                     waits.append(max(0.0, earliest - now))
@@ -491,11 +535,16 @@ class KeyPool:
         with self._lock:
             self._expire_cooldowns(now, today)
 
+            in_window = {key.id for key in self._working_set()}
+
             return [
                 {
                     "id": key.id,
                     "label": key.label,
                     "state": key.state,
+                    "enabled": key.enabled,
+                    # Whether this key is one of the ones currently in play.
+                    "in_use": key.id in in_window,
                     "used_today": key.used_today,
                     "rpd_limit": key.rpd_limit,
                     "rpm_limit": key.rpm_limit,
@@ -519,12 +568,18 @@ class KeyPool:
                 if key.refresh_for_today(today):
                     self._persist(key)
 
-            live = [k for k in self._keys if k.state != STATE_DEAD]
+            live = [k for k in self._keys if k.state != STATE_DEAD and k.enabled]
+            working = self._working_set()
 
             return {
                 "keys_total": len(self._keys),
                 "keys_live": len(live),
-                "keys_dead": len(self._keys) - len(live),
+                "keys_dead": len([k for k in self._keys if k.state == STATE_DEAD]),
+                "keys_disabled": len([k for k in self._keys if not k.enabled]),
+
+                # How many are in play right now, and the hard ceiling.
+                "keys_in_use": len(working),
+                "max_concurrent_keys": MAX_CONCURRENT_KEYS,
 
                 # Spend is counted across ALL keys including dead ones: a key
                 # that was revoked at noon still spent whatever it spent that
@@ -539,6 +594,19 @@ class KeyPool:
             }
 
     def has_live_keys(self) -> bool:
-        """False when every key is dead — the run cannot continue at all."""
+        """False when no key could ever be used — the run cannot continue."""
         with self._lock:
-            return any(k.state != STATE_DEAD for k in self._keys)
+            return any(k.state != STATE_DEAD and k.enabled for k in self._keys)
+
+    def working_set_size(self) -> int:
+        """
+        How many keys are in play right now.
+
+        This, not the total key count, is how many worker threads are worth
+        starting: a thread with no key to use can only sleep.
+        """
+        now = time.time()
+        today = pacific_date()
+        with self._lock:
+            self._expire_cooldowns(now, today)
+            return len(self._working_set())

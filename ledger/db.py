@@ -161,6 +161,7 @@ CREATE TABLE IF NOT EXISTS api_keys (
     last_used_at            REAL    NOT NULL DEFAULT 0,
     consecutive_rate_limits INTEGER NOT NULL DEFAULT 0,
     last_error              TEXT    NOT NULL DEFAULT '',
+    enabled                 INTEGER NOT NULL DEFAULT 1,
     created_at              REAL    NOT NULL
 );
 
@@ -243,6 +244,32 @@ class Database:
 
     def _init_schema(self) -> None:
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """
+        Add columns that older databases predate.
+
+        `CREATE TABLE IF NOT EXISTS` does nothing to a table that already
+        exists, so a database created by an earlier version keeps its old
+        column set. Each migration here is additive and safe to run every time
+        — no data is moved or rewritten, so an interrupted upgrade leaves
+        nothing half-done.
+        """
+        wanted = [
+            # (table, column, definition)
+            ("api_keys", "enabled", "INTEGER NOT NULL DEFAULT 1"),
+        ]
+
+        for table, column, definition in wanted:
+            existing = {
+                row["name"]
+                for row in self.conn.execute(f"PRAGMA table_info({table})")
+            }
+            if column not in existing:
+                self.conn.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+                )
 
     def close(self) -> None:
         existing = getattr(self._local, "conn", None)
@@ -644,6 +671,7 @@ class Database:
         secret: str,
         rpm_limit: int = 10,
         rpd_limit: int = 250,
+        enabled: bool = True,
     ) -> int:
         """
         Add or update a key by label.
@@ -659,20 +687,21 @@ class Database:
             self.conn.execute(
                 """
                 UPDATE api_keys
-                   SET secret = ?, rpm_limit = ?, rpd_limit = ?
+                   SET secret = ?, rpm_limit = ?, rpd_limit = ?, enabled = ?
                  WHERE id = ?
                 """,
-                (secret, rpm_limit, rpd_limit, row["id"]),
+                (secret, rpm_limit, rpd_limit, 1 if enabled else 0, row["id"]),
             )
             return int(row["id"])
 
         cursor = self.conn.execute(
             """
             INSERT INTO api_keys
-                (label, secret, rpm_limit, rpd_limit, used_on, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (label, secret, rpm_limit, rpd_limit, enabled, used_on, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (label, secret, rpm_limit, rpd_limit, pacific_date(), time.time()),
+            (label, secret, rpm_limit, rpd_limit, 1 if enabled else 0,
+             pacific_date(), time.time()),
         )
         return int(cursor.lastrowid)
 
@@ -694,6 +723,7 @@ class Database:
                 last_used_at=float(r["last_used_at"]),
                 consecutive_rate_limits=int(r["consecutive_rate_limits"]),
                 last_error=r["last_error"],
+                enabled=bool(r["enabled"]),
             )
             for r in rows
         ]
@@ -710,13 +740,14 @@ class Database:
             UPDATE api_keys
                SET rpm_limit = ?, rpd_limit = ?, state = ?, used_on = ?,
                    used_today = ?, cooldown_until = ?, last_used_at = ?,
-                   consecutive_rate_limits = ?, last_error = ?
+                   consecutive_rate_limits = ?, last_error = ?, enabled = ?
              WHERE id = ?
             """,
             (
                 key.rpm_limit, key.rpd_limit, key.state, key.used_on,
                 key.used_today, key.cooldown_until, key.last_used_at,
-                key.consecutive_rate_limits, key.last_error, key.id,
+                key.consecutive_rate_limits, key.last_error,
+                1 if key.enabled else 0, key.id,
             ),
         )
 

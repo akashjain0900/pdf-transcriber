@@ -19,10 +19,10 @@ next to the expected one, so a stale deployment is visible rather than being
 diagnosed later from odd sheet contents.
 """
 
-SCRIPT_VERSION = "2"
+SCRIPT_VERSION = "4"
 
 APPS_SCRIPT_CODE = r"""/**
- * Ledger — Old Book Transcriber, Apps Script backend (v2).
+ * Ledger — Old Book Transcriber, Apps Script backend (v4).
  *
  * SETUP
  * 1. Create (or open) the Google Sheet you want transcriptions written into.
@@ -40,16 +40,29 @@ APPS_SCRIPT_CODE = r"""/**
  * (pencil) -> New version. Otherwise the live URL keeps running the old code.
  */
 
-var SCRIPT_VERSION = "2";
+var SCRIPT_VERSION = "4";
 var SHARED_SECRET = "";   // e.g. "vk5-ledger-2026" — leave "" to skip the check.
 var INDEX_TAB = "Index";
 
-/** Columns written for every page. Order must match Ledger's publisher. */
+/**
+ * Columns written for every page. Order must match Ledger's publisher.
+ *
+ * A Google Sheets cell holds at most 50,000 characters, and some pages exceed
+ * that. Such a page is spread across the four Transcription columns, split at
+ * line boundaries, so rejoining it is just =C2&D2&E2&F2. Almost every page uses
+ * only the first, leaving the rest blank.
+ *
+ * The overflow goes sideways rather than onto extra rows on purpose: each page
+ * is written to the row matching its page number, which is what makes
+ * republishing overwrite rather than duplicate.
+ */
 var HEADERS = [
   "PDF Page",
-  "Printed Page",
   "Type",
   "Transcription",
+  "Transcription 2",
+  "Transcription 3",
+  "Transcription 4",
   "Footnotes",
   "Note",
   "Status"
@@ -121,8 +134,13 @@ function getOrCreateBookSheet(ss, tabName) {
   sheet = ss.insertSheet(title);
   sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
   sheet.setFrozenRows(1);
-  sheet.setColumnWidth(4, 520);   // Transcription
-  sheet.setColumnWidth(5, 260);   // Footnotes
+  sheet.setColumnWidth(3, 520);   // Transcription
+  // The continuation columns are narrow: they are nearly always empty, and
+  // wide empty columns just push the useful ones off screen.
+  sheet.setColumnWidth(4, 90);    // Transcription 2
+  sheet.setColumnWidth(5, 90);    // Transcription 3
+  sheet.setColumnWidth(6, 90);    // Transcription 4
+  sheet.setColumnWidth(7, 260);   // Footnotes
   return { sheet: sheet, title: title };
 }
 
@@ -216,14 +234,14 @@ function getBookStatus(data) {
   var last = sheet.getLastRow();
   if (last < 2) return { ok: true, exists: true, pages: [] };
 
-  var values = sheet.getRange(2, 1, last - 1, 4).getValues();
+  var values = sheet.getRange(2, 1, last - 1, HEADERS.length).getValues();
   var pages = [];
   for (var i = 0; i < values.length; i++) {
     var pageNumber = values[i][0];
     if (pageNumber === "" || pageNumber === null) continue;
     pages.push({
       pageNumber: Number(pageNumber),
-      hasText: String(values[i][3] || "").length > 0
+      hasText: String(values[i][2] || "").length > 0
     });
   }
   return { ok: true, exists: true, tab: title, pages: pages };

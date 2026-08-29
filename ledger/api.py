@@ -54,6 +54,24 @@ class KeyInput(BaseModel):
     secret: str
     rpm_limit: int = 10
     rpd_limit: int = 250
+    enabled: bool = True
+
+
+class KeyUpdate(BaseModel):
+    """
+    Edit an existing key's quota or whether it is used.
+
+    `secret` is optional so the quota can be changed without retyping the key.
+    """
+    rpm_limit: int | None = None
+    rpd_limit: int | None = None
+    enabled: bool | None = None
+    secret: str | None = None
+
+
+class KeyImport(BaseModel):
+    """A keys.json file, uploaded from the browser."""
+    keys: list[KeyInput]
 
 
 class SheetsSettings(BaseModel):
@@ -341,7 +359,75 @@ def create_app(config: Config) -> FastAPI:
             secret=body.secret.strip(),
             rpm_limit=body.rpm_limit,
             rpd_limit=body.rpd_limit,
+            enabled=body.enabled,
         )
+        _reload_keys()
+        return {"saved": True}
+
+    @app.post("/api/keys/import")
+    def import_keys(body: KeyImport):
+        """
+        Bulk import from a keys.json file.
+
+        Same format the `ledger keys import` command takes, so one file works
+        for both. Existing labels are updated without resetting today's usage,
+        which makes re-importing the file safe.
+        """
+        if not body.keys:
+            raise HTTPException(400, "The file contained no keys.")
+
+        imported = 0
+        skipped: list[str] = []
+
+        for entry in body.keys:
+            if not entry.label.strip() or not entry.secret.strip():
+                skipped.append(entry.label or "(no label)")
+                continue
+
+            database.add_key(
+                label=entry.label.strip(),
+                secret=entry.secret.strip(),
+                rpm_limit=entry.rpm_limit,
+                rpd_limit=entry.rpd_limit,
+                enabled=entry.enabled,
+            )
+            imported += 1
+
+        _reload_keys()
+        database.log(f"Imported {imported} key(s) from an uploaded file.", "ok")
+        return {"imported": imported, "skipped": skipped}
+
+    @app.put("/api/keys/{label}")
+    def update_key(label: str, body: KeyUpdate):
+        """
+        Change one key's quota, or enable/disable it.
+
+        Today's usage is preserved: this edits the limits, not the counters. If
+        raising the daily limit brings a key back under its ceiling, it also
+        comes out of the exhausted state so the rest of the allowance is usable
+        immediately rather than after the next reset.
+        """
+        keys = {key.label: key for key in database.load_keys()}
+        if label not in keys:
+            raise HTTPException(404, "No such key")
+
+        key = keys[label]
+
+        if body.rpm_limit is not None:
+            key.rpm_limit = max(0, body.rpm_limit)
+        if body.rpd_limit is not None:
+            key.rpd_limit = max(1, body.rpd_limit)
+        if body.enabled is not None:
+            key.enabled = body.enabled
+        if body.secret and body.secret.strip():
+            key.secret = body.secret.strip()
+
+        # Raising the ceiling on an exhausted key should make it usable again.
+        if key.state == "exhausted" and key.used_today < key.rpd_limit:
+            key.state = "active"
+            key.last_error = ""
+
+        database.save_key(key)
         _reload_keys()
         return {"saved": True}
 

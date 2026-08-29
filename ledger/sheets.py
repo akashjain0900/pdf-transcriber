@@ -32,6 +32,31 @@ CHUNK_SIZE = 150
 # Apps Script can be slow to wake a cold deployment.
 REQUEST_TIMEOUT = 120
 
+# Google Sheets refuses more than 50,000 characters in a single cell. 45,000
+# leaves room for the continuation marker appended to each split part.
+MAX_CELL_CHARS = 45_000
+
+# How many adjacent columns a single page's transcription may spill across.
+#
+# Overflow goes SIDEWAYS, never into extra rows. Every page is written to the
+# row matching its page number (row = page + 1), and that is the whole reason
+# republishing is safe: write the same page twice and it lands in the same
+# cells. Continuation rows would break that mapping and reintroduce the
+# duplicate-row problem the batched publisher exists to solve.
+#
+# Four columns holds 180,000 characters. For scale, the densest page in this
+# corpus is about 27,000, and the model's own output ceiling puts a hard limit
+# well inside this. If a page somehow exceeds even that, the last cell is
+# truncated with a marker rather than failing the upload.
+TRANSCRIPTION_COLUMNS = 4
+
+# Total characters allowed in one request to Apps Script.
+#
+# Chunks are bounded by characters as well as row count now: 150 ordinary pages
+# is a modest payload, but 150 pages that each need four cells would not be, and
+# a request too large to process would fail the whole chunk.
+MAX_CHUNK_CHARS = 2_000_000
+
 
 class SheetsError(Exception):
     """Anything that went wrong talking to the Apps Script deployment."""
@@ -97,6 +122,94 @@ def test_connection(url: str, secret: str) -> dict:
     }
 
 
+def build_tab_names(books) -> dict:
+    """
+    Work out one tab name per book, keyed by book id.
+
+    The tab is simply the PDF's name: `010.pdf` becomes a tab called `010`.
+
+    The only complication is that two different PDFs in different folders can
+    share a filename, and two tabs cannot share a name. Where that happens the
+    id is appended to the duplicates *only* — so in the normal case every tab is
+    the clean name, and a collision is disambiguated rather than silently
+    overwriting another book's transcriptions.
+    """
+    counts: dict[str, int] = {}
+    for book in books:
+        counts[book["title"]] = counts.get(book["title"], 0) + 1
+
+    names = {}
+    for book in books:
+        title = book["title"]
+        if counts[title] == 1:
+            names[int(book["id"])] = title[:95]
+        else:
+            # Ambiguous name — keep it readable but make it unique.
+            names[int(book["id"])] = f"{title} ({int(book['id'])})"[:95]
+    return names
+
+
+def split_for_cells(
+    text: str,
+    columns: int = TRANSCRIPTION_COLUMNS,
+    limit: int = MAX_CELL_CHARS,
+) -> tuple[list[str], bool]:
+    """
+    Split one page's text across up to `columns` cells.
+
+    Returns (parts, was_truncated). `parts` is always exactly `columns` long,
+    padded with empty strings, so every row has the same width and the range
+    write stays rectangular.
+
+    Splits are made at the last line break before the limit, falling back to
+    the last space, so a cell never ends mid-word and each part starts on a
+    clean line. Reassembling the page is then a plain concatenation of the
+    cells left to right — in the sheet itself, `=C2&D2&E2&F2`.
+    """
+    if len(text) <= limit:
+        return [text] + [""] * (columns - 1), False
+
+    parts: list[str] = []
+    remaining = text
+
+    while remaining and len(parts) < columns:
+        if len(remaining) <= limit:
+            parts.append(remaining)
+            remaining = ""
+            break
+
+        window = remaining[:limit]
+
+        # Prefer a paragraph or line boundary, then a word boundary. Only fall
+        # back to a hard cut if the text contains neither, which in practice
+        # means it is not prose at all.
+        cut = window.rfind("\n")
+        if cut < limit // 2:
+            cut = window.rfind(" ")
+        if cut < limit // 2:
+            cut = limit
+
+        parts.append(remaining[:cut])
+        remaining = remaining[cut:].lstrip("\n")
+
+    truncated = bool(remaining)
+    if truncated:
+        # Every column is full and there is still text left. Mark the last cell
+        # so the sheet never silently misrepresents the page.
+        #
+        # The slice reserves exactly the marker's own length, measured rather
+        # than guessed — a hardcoded margin smaller than the marker would push
+        # the cell back over the limit, which is the very thing being avoided.
+        marker = (
+            "\n\n[TRUNCATED — this page exceeds what a sheet row can hold. "
+            "Full text is in the JSON and .txt exports.]"
+        )
+        parts[-1] = parts[-1][: limit - len(marker)] + marker
+
+    parts += [""] * (columns - len(parts))
+    return parts, truncated
+
+
 def _page_to_row(row) -> list:
     """
     One sheet row for one page. Column order must match HEADERS in the Apps
@@ -117,15 +230,51 @@ def _page_to_row(row) -> list:
         elif page_type == "unreadable":
             text = "[UNREADABLE]"
 
-    return [
-        int(row["page_no"]),
-        row["printed_page_number"] or "",
-        page_type,
-        text,
-        row["footnotes"] or "",
-        row["note"] or row["flag_reason"] or "",
-        row["status"],
-    ]
+    parts, truncated = split_for_cells(text)
+
+    # Footnotes get the same protection; a single cell's worth is ample for
+    # them, so they are capped rather than spread.
+    footnotes = row["footnotes"] or ""
+    if len(footnotes) > MAX_CELL_CHARS:
+        footnotes = footnotes[: MAX_CELL_CHARS - 40] + "\n[TRUNCATED — see exports]"
+
+    return (
+        [int(row["page_no"]), page_type]
+        + parts
+        + [footnotes, row["note"] or row["flag_reason"] or "", row["status"]]
+    ), truncated
+
+
+def _build_chunks(rows: list[list]) -> list[list[list]]:
+    """
+    Group rows into requests, bounded by BOTH row count and total characters.
+
+    Row count alone is not enough once a page can occupy four cells: 150
+    ordinary pages is a small payload, but 150 very long ones would be large
+    enough to fail, and a failed chunk fails the whole book.
+    """
+    chunks: list[list[list]] = []
+    current: list[list] = []
+    current_chars = 0
+
+    for row in rows:
+        row_chars = sum(len(cell) for cell in row if isinstance(cell, str))
+
+        too_many_rows = len(current) >= CHUNK_SIZE
+        too_many_chars = current and current_chars + row_chars > MAX_CHUNK_CHARS
+
+        if too_many_rows or too_many_chars:
+            chunks.append(current)
+            current = []
+            current_chars = 0
+
+        current.append(row)
+        current_chars += row_chars
+
+    if current:
+        chunks.append(current)
+
+    return chunks
 
 
 class PublishJob:
@@ -146,6 +295,8 @@ class PublishJob:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self._cancel = False
+
+        self._tab_names: dict = {}
 
         self.state = "idle"          # idle | running | done | failed | cancelled
         self.books_total = 0
@@ -195,7 +346,14 @@ class PublishJob:
 
     def _run(self) -> None:
         try:
-            books = self.db.list_books()
+            all_books = self.db.list_books()
+
+            # Names are worked out across the WHOLE library, not just the books
+            # being published, so a duplicate filename is spotted even when only
+            # one of the pair is in this run.
+            self._tab_names = build_tab_names(all_books)
+
+            books = all_books
             if self.book_id is not None:
                 books = [b for b in books if int(b["id"]) == int(self.book_id)]
 
@@ -244,20 +402,50 @@ class PublishJob:
         publishes cleanly and can be republished later once it finishes.
         """
         book_id = int(book["id"])
-        rows = [
-            _page_to_row(page)
-            for page in self.db.pages_for_book(book_id)
-            if page["status"] in ("done", "flagged")
-        ]
+
+        rows = []
+        split_pages = 0
+        truncated_pages = []
+
+        for page in self.db.pages_for_book(book_id):
+            if page["status"] not in ("done", "flagged"):
+                continue
+
+            row, truncated = _page_to_row(page)
+            rows.append(row)
+
+            # Columns 2..2+TRANSCRIPTION_COLUMNS hold the transcription.
+            if any(row[3 : 2 + TRANSCRIPTION_COLUMNS]):
+                split_pages += 1
+            if truncated:
+                truncated_pages.append(int(page["page_no"]))
 
         if not rows:
             return 0
 
-        # A stable tab name per book. The id prefix guarantees two books with
-        # the same title never collide in the same tab.
-        tab = f"{book_id:04d} {book['title']}"[:95]
+        if split_pages:
+            self.db.log(
+                f"“{book['title']}”: {split_pages} page(s) exceeded the 50,000 "
+                "character cell limit and were spread across the Transcription "
+                "columns. Rejoin them in the sheet with =C2&D2&E2&F2.",
+                "info",
+                book_id=book_id,
+            )
 
-        chunks = [rows[i : i + CHUNK_SIZE] for i in range(0, len(rows), CHUNK_SIZE)]
+        if truncated_pages:
+            self.db.log(
+                f"“{book['title']}”: page(s) {truncated_pages} are too long "
+                "even for four cells and were truncated in the sheet. The full "
+                "text is in the JSON and .txt exports. A page this long is "
+                "worth checking — it is usually a dense index or a repetition "
+                "loop.",
+                "warn",
+                book_id=book_id,
+            )
+
+        tab = self._tab_names.get(book_id, book["title"][:95])
+
+        chunks = _build_chunks(rows)
 
         for index, chunk in enumerate(chunks):
             with self._lock:

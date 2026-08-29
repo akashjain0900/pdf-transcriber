@@ -602,7 +602,23 @@ class Engine:
             )
 
         self._running = True
-        worker_count = min(capacity["keys_live"], self.config.max_workers)
+
+        # One worker per key IN PLAY, not per key owned. Only a few keys are
+        # used at a time (see quota.MAX_CONCURRENT_KEYS), and a thread with no
+        # key available to it can do nothing but sleep.
+        worker_count = min(
+            self.pool.working_set_size(),
+            self.config.max_workers,
+        )
+
+        if worker_count == 0:
+            self._running = False
+            self.log(
+                "No keys are in play. Check that keys are enabled and have "
+                "quota left today.",
+                "err",
+            )
+            return 0
 
         self._threads = []
         for index in range(worker_count):
@@ -628,9 +644,10 @@ class Engine:
             return 0
 
         self.log(
-            f"Started {alive} worker(s). "
+            f"Started {alive} worker(s) on {capacity['keys_in_use']} key(s) in "
+            f"play (limit {capacity['max_concurrent_keys']}). "
             f"{capacity['remaining_today']} request(s) available today across "
-            f"{capacity['keys_live']} key(s).",
+            f"{capacity['keys_live']} enabled key(s).",
             "ok",
         )
         return alive

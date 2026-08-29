@@ -396,6 +396,325 @@ def test_settings_and_sheets():
         )
 
 
+def test_key_import_and_editing():
+    print("\nKey import and per-key editing")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        client, _, database = make_client(Path(tmp))
+
+        # Bulk import, in the same format the CLI accepts.
+        payload = {"keys": [
+            {"label": f"acct-{i:02d}", "secret": f"secret-{i:02d}",
+             "rpm_limit": 10, "rpd_limit": 250}
+            for i in range(1, 9)
+        ]}
+        result = client.post("/api/keys/import", json=payload).json()
+        R.check("eight keys imported", result["imported"] == 8, str(result))
+
+        keys = client.get("/api/keys").json()
+        R.check("all eight listed", len(keys) == 8, str(len(keys)))
+        R.check("all enabled by default", all(k["enabled"] for k in keys))
+
+        # Only five may be in play at once.
+        in_play = [k["label"] for k in keys if k["in_use"]]
+        R.check("exactly five in play", len(in_play) == 5, str(in_play))
+        R.check(
+            "they are the first five in order",
+            in_play == [f"acct-{i:02d}" for i in range(1, 6)],
+            str(in_play),
+        )
+
+        capacity = client.get("/api/status").json()["capacity"]
+        R.check("capacity reports the window", capacity["keys_in_use"] == 5, str(capacity))
+        R.check("capacity reports the ceiling", capacity["max_concurrent_keys"] == 5)
+
+        # Re-importing must not reset usage.
+        from ledger.quota import KeyPool
+        pool = KeyPool(database.load_keys(), on_change=database.save_key)
+        pool.record_success(pool.acquire())
+        client.post("/api/keys/import", json=payload)
+        keys = {k["label"]: k for k in client.get("/api/keys").json()}
+        R.check(
+            "re-import preserves usage",
+            sum(k["used_today"] for k in keys.values()) == 1,
+            str([(k, v["used_today"]) for k, v in keys.items()]),
+        )
+
+        R.check(
+            "an empty import is rejected",
+            client.post("/api/keys/import", json={"keys": []}).status_code == 400,
+        )
+
+        # Edit one key's quota without touching its secret.
+        client.put("/api/keys/acct-01", json={"rpm_limit": 3, "rpd_limit": 40})
+        keys = {k["label"]: k for k in client.get("/api/keys").json()}
+        R.check("rpm updated", keys["acct-01"]["rpm_limit"] == 3, str(keys["acct-01"]))
+        R.check("rpd updated", keys["acct-01"]["rpd_limit"] == 40, str(keys["acct-01"]))
+        # "secret-01" -> last four characters are "t-01".
+        R.check(
+            "the secret was left alone",
+            keys["acct-01"]["secret_tail"] == "t-01",
+            keys["acct-01"]["secret_tail"],
+        )
+
+        # Disabling a key must free its slot for the next one in line.
+        client.put("/api/keys/acct-02", json={"enabled": False})
+        keys = client.get("/api/keys").json()
+        by_label = {k["label"]: k for k in keys}
+        R.check("key disabled", by_label["acct-02"]["enabled"] is False)
+        R.check("a disabled key is not in play", by_label["acct-02"]["in_use"] is False)
+
+        in_play = [k["label"] for k in keys if k["in_use"]]
+        R.check("still five in play", len(in_play) == 5, str(in_play))
+        R.check(
+            "the next key was promoted",
+            "acct-06" in in_play and "acct-02" not in in_play,
+            str(in_play),
+        )
+
+        R.check(
+            "editing an unknown key is a 404",
+            client.put("/api/keys/nope", json={"rpm_limit": 5}).status_code == 404,
+        )
+
+        # Raising the ceiling on an exhausted key should make it usable again
+        # rather than waiting for the next reset.
+        loaded = {k.label: k for k in database.load_keys()}["acct-03"]
+        loaded.used_today = 250
+        loaded.state = "exhausted"
+        database.save_key(loaded)
+
+        client.put("/api/keys/acct-03", json={"rpd_limit": 500})
+        by_label = {k["label"]: k for k in client.get("/api/keys").json()}
+        R.check(
+            "raising the limit revives an exhausted key",
+            by_label["acct-03"]["state"] == "active",
+            by_label["acct-03"]["state"],
+        )
+
+
+def test_key_rotation_promotes_next():
+    print("\nKey rotation as keys are spent")
+
+    from ledger.quota import ApiKey, KeyPool
+
+    keys = [
+        ApiKey(id=i, label=f"k{i:02d}", secret=f"s{i}", rpm_limit=0, rpd_limit=2)
+        for i in range(1, 11)
+    ]
+    pool = KeyPool(keys)
+
+    R.check("ten keys, five in play", pool.working_set_size() == 5)
+
+    # Spend the first two completely; the sixth and seventh should step in.
+    for key in keys[:2]:
+        for _ in range(2):
+            pool.record_success(key)
+
+    in_play = [k["label"] for k in pool.snapshot() if k["in_use"]]
+    R.check(
+        "spent keys are replaced in order",
+        in_play == ["k03", "k04", "k05", "k06", "k07"],
+        str(in_play),
+    )
+
+    # Total daily capacity is unaffected by the window — every key still gets
+    # used, just not all at once.
+    R.check(
+        "the window does not reduce daily capacity",
+        pool.capacity_today()["remaining_today"] == 16,
+        str(pool.capacity_today()),
+    )
+
+    # Spend everything.
+    for _ in range(100):
+        key = pool.acquire()
+        if key is None:
+            break
+        pool.record_success(key)
+
+    R.check("every key was eventually used", pool.working_set_size() == 0)
+    R.check(
+        "all twenty requests were spent",
+        pool.capacity_today()["used_today"] == 20,
+        str(pool.capacity_today()),
+    )
+
+
+def test_sheet_and_export_naming():
+    print("\nSheet tab and export file naming")
+
+    from ledger.export import build_file_stems
+    from ledger.sheets import build_tab_names
+
+    # Normal case: the tab and the files are simply the PDF's name.
+    books = [
+        {"id": 1, "title": "010"},
+        {"id": 2, "title": "007"},
+        {"id": 3, "title": "001"},
+    ]
+    tabs = build_tab_names(books)
+    R.check("tab is just the PDF name", tabs[1] == "010", tabs[1])
+    R.check("no id prefix", tabs[2] == "007", tabs[2])
+
+    stems = build_file_stems(books)
+    R.check("export file is just the PDF name", stems[1] == "010", stems[1])
+    R.check("no zero-padded prefix", stems[3] == "001", stems[3])
+
+    # Two PDFs sharing a filename cannot share a tab, so only those are
+    # disambiguated — the rest keep their clean names.
+    clashing = [
+        {"id": 1, "title": "010"},
+        {"id": 2, "title": "010"},
+        {"id": 3, "title": "011"},
+    ]
+    tabs = build_tab_names(clashing)
+    R.check("duplicates are made unique", tabs[1] != tabs[2], f"{tabs[1]} vs {tabs[2]}")
+    R.check("duplicate names mention the id", "1" in tabs[1] and "2" in tabs[2], str(tabs))
+    R.check("the unaffected book keeps its clean name", tabs[3] == "011", tabs[3])
+
+    stems = build_file_stems(clashing)
+    R.check("duplicate export stems are unique", stems[1] != stems[2], str(stems))
+    R.check("unaffected export stem stays clean", stems[3] == "011", stems[3])
+
+
+def test_long_page_split_across_cells():
+    print("\nOver-long pages split across cells")
+
+    from ledger.sheets import (
+        MAX_CELL_CHARS,
+        TRANSCRIPTION_COLUMNS,
+        _build_chunks,
+        split_for_cells,
+    )
+
+    # An ordinary page occupies one cell and leaves the rest empty.
+    short = "Van de oude gebruiken dezer landen."
+    parts, truncated = split_for_cells(short)
+    R.check("short page fits one cell", parts[0] == short and not truncated)
+    R.check(
+        "the row is always the same width",
+        len(parts) == TRANSCRIPTION_COLUMNS and parts[1:] == [""] * (TRANSCRIPTION_COLUMNS - 1),
+        str([len(p) for p in parts]),
+    )
+
+    # A realistic over-long page: prose in lines, ~81,000 characters.
+    line = "Van de oude gebruiken dezer landen valt zeer veel te verhalen, regel"
+    text = "\n".join(f"{line} {i}." for i in range(1100))
+    R.check("test page really is over the limit", len(text) > 50_000, str(len(text)))
+
+    parts, truncated = split_for_cells(text)
+
+    R.check("it was not truncated", truncated is False)
+    R.check(
+        "every cell is under the Sheets limit",
+        all(len(p) < 50_000 for p in parts),
+        str([len(p) for p in parts]),
+    )
+    R.check(
+        "it rejoins losslessly",
+        "\n".join(p for p in parts if p) == text,
+    )
+    R.check(
+        "splits land on line boundaries, not mid-word",
+        parts[0].endswith(".") and parts[1].startswith("Van"),
+        f"...{parts[0][-20:]!r} / {parts[1][:20]!r}...",
+    )
+    R.check("only as many cells as needed are used", parts[2] == "" and parts[3] == "")
+
+    # Text with no whitespace at all must still split rather than fail.
+    blob = "x" * (MAX_CELL_CHARS * 2 + 100)
+    parts, truncated = split_for_cells(blob)
+    R.check(
+        "text with no break points still splits",
+        all(len(p) <= MAX_CELL_CHARS for p in parts) and not truncated,
+        str([len(p) for p in parts]),
+    )
+    R.check("and loses nothing", "".join(parts) == blob)
+
+    # Beyond every column, it must mark the loss rather than fail silently.
+    huge = "y" * (MAX_CELL_CHARS * TRANSCRIPTION_COLUMNS + 10_000)
+    parts, truncated = split_for_cells(huge)
+    R.check("an absurdly long page is flagged truncated", truncated is True)
+    R.check("the last cell says so", "TRUNCATED" in parts[-1], parts[-1][-60:])
+    R.check("it points at the exports", "exports" in parts[-1])
+    R.check(
+        "no cell exceeds the limit even then",
+        all(len(p) <= MAX_CELL_CHARS for p in parts),
+        str([len(p) for p in parts]),
+    )
+
+    # Chunking must be bounded by characters too, not only row count.
+    fat_rows = [[i, "text", "z" * 40_000, "", "", "", "", "", "done"] for i in range(60)]
+    chunks = _build_chunks(fat_rows)
+    R.check(
+        "long pages produce more, smaller chunks",
+        len(chunks) > 1,
+        f"{len(chunks)} chunk(s) for 60 fat rows",
+    )
+    R.check(
+        "every chunk stays within the character budget",
+        all(
+            sum(len(c) for r in chunk for c in r if isinstance(c, str)) <= 2_100_000
+            for chunk in chunks
+        ),
+    )
+    R.check(
+        "no row is lost or duplicated by chunking",
+        sum(len(c) for c in chunks) == 60,
+        str(sum(len(c) for c in chunks)),
+    )
+
+    # Ordinary pages should still batch efficiently.
+    thin_rows = [[i, "text", "a" * 2000, "", "", "", "", "", "done"] for i in range(400)]
+    chunks = _build_chunks(thin_rows)
+    R.check(
+        "ordinary pages still batch by row count",
+        max(len(c) for c in chunks) == 150,
+        str([len(c) for c in chunks]),
+    )
+
+
+def test_plain_text_export():
+    print("\nPlain text export")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        client, config, database = make_client(Path(tmp))
+        client.post("/api/scan")
+        book_id = client.get("/api/books").json()[0]["id"]
+
+        database.save_page_result(
+            book_id, 16, PAGE_DONE,
+            {"page_type": "text", "transcription": "Van de oude gebruiken",
+             "footnotes": "1. Zie boven."},
+            {},
+        )
+        database.save_page_result(
+            book_id, 17, PAGE_DONE,
+            {"page_type": "blank", "transcription": ""}, {},
+        )
+
+        client.post("/api/export")
+
+        txt = sorted(Path(config.export_dir).glob("*.txt"))
+        R.check("a .txt is written per book", len(txt) == 2, str([p.name for p in txt]))
+        R.check(
+            "named after the PDF",
+            {p.stem for p in txt} == {"boek-1", "boek-2"},
+            str([p.name for p in txt]),
+        )
+
+        content = next(p for p in txt if p.stem == "boek-1").read_text(encoding="utf-8")
+        R.check("the transcription is in it", "Van de oude gebruiken" in content)
+        R.check("page breaks are marked", "--- PDF page 16 ---" in content)
+        R.check("footnotes are included", "1. Zie boven." in content)
+        R.check("a blank page says so", "[BLANK]" in content)
+        R.check(
+            "untranscribed pages are explicit, not silent gaps",
+            "[not transcribed: pending]" in content,
+        )
+
+
 def test_apps_script_served():
     print("\nApps Script source")
 
@@ -410,6 +729,14 @@ def test_apps_script_served():
         # per-page appendRow must be gone.
         R.check("it uses batched range writes", "setValues" in result["code"])
         R.check("syncChunk action present", "syncChunk" in result["code"])
+        R.check(
+            "the printed-page header is gone",
+            '"Printed Page"' not in result["code"],
+        )
+        R.check(
+            "continuation columns are declared",
+            '"Transcription 4"' in result["code"],
+        )
         R.check(
             "no per-page appendRow for transcriptions",
             "appendRow([pageNumber" not in result["code"],
@@ -584,15 +911,22 @@ def test_publish_flow_stubbed():
             R.check("the sync action was used", calls[0]["action"] == "syncChunk", calls[0]["action"])
             R.check("rows carry the page number first", payload["rows"][0][0] == 16, str(payload["rows"][0]))
             R.check(
-                "rows carry the printed page number",
-                payload["rows"][0][1] == "1",
+                "row layout is page, type, 4 transcription cells, footnotes, note, status",
+                len(payload["rows"][0]) == 9 and payload["rows"][0][1] == "text",
                 str(payload["rows"][0]),
+            )
+            R.check(
+                "the transcription is in the first transcription cell",
+                payload["rows"][0][2].startswith("Bladzijde"),
+                str(payload["rows"][0][2])[:40],
             )
             R.check("the final chunk is marked", payload["isFinalChunk"] is True)
             R.check("the machine is identified", payload["machine"] == "api-test", payload["machine"])
+            # The tab is simply the PDF's name — boek-1.pdf goes to a tab
+            # called "boek-1", with no id prefix or decoration.
             R.check(
-                "the tab name is stable and id-prefixed",
-                payload["tab"].startswith(f"{book_id:04d} "),
+                "the tab is named after the PDF",
+                payload["tab"] == "boek-1",
                 payload["tab"],
             )
 
@@ -623,15 +957,15 @@ def test_publish_marks_empty_page_types():
 
         from ledger.sheets import _page_to_row
         rows = {
-            int(page["page_no"]): _page_to_row(page)
+            int(page["page_no"]): _page_to_row(page)[0]
             for page in database.pages_for_book(book_id)
             if page["status"] == "done"
         }
 
         # An empty cell would be ambiguous with "not transcribed yet", which
         # could never be resolved afterwards.
-        R.check("blank pages are marked", rows[1][3] == "[BLANK]", str(rows[1]))
-        R.check("illustration pages are marked", rows[2][3] == "[IMAGE]", str(rows[2]))
+        R.check("blank pages are marked", rows[1][2] == "[BLANK]", str(rows[1]))
+        R.check("illustration pages are marked", rows[2][2] == "[IMAGE]", str(rows[2]))
 
 
 def main():
@@ -648,6 +982,11 @@ def main():
         test_keys_endpoints,
         test_run_control,
         test_settings_and_sheets,
+        test_key_import_and_editing,
+        test_key_rotation_promotes_next,
+        test_sheet_and_export_naming,
+        test_long_page_split_across_cells,
+        test_plain_text_export,
         test_apps_script_served,
         test_requeue_and_export,
         test_remove_book,

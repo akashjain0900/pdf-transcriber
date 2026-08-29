@@ -19,7 +19,7 @@ from pathlib import Path
 
 # Bumped on every behaviour change so a page's `app_version` tells you exactly
 # which build produced it. Cheap traceability; do not skip bumping this.
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.5.1"
 
 
 def _load_dotenv(path: Path) -> None:

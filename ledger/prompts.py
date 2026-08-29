@@ -24,8 +24,22 @@ is very hard to reason about later.
 from __future__ import annotations
 
 
-PROMPT_VERSION = "page-v1"
+PROMPT_VERSION = "page-v2"
 PROFILE_PROMPT_VERSION = "profile-v1"
+
+
+# Deliberately NOT requested: the page number printed on the paper.
+#
+# Pages are identified by their position in the PDF (`page_no` in the database),
+# which is the primary key, the order the queue works in, and the row a page is
+# written to in the sheet. The number printed on the paper is a separate thing
+# that often disagrees with it, and it is not wanted here — so the model is not
+# asked for it and spends no output tokens on it.
+#
+# The field itself survives, empty, through the database, export, API and sheet.
+# That is intentional: dropping the column would mean a schema migration for a
+# field that costs nothing at rest, and it leaves the door open if the printed
+# numbers are ever wanted after all.
 
 
 # ---------------------------------------------------------------------
@@ -67,14 +81,6 @@ PAGE_RESPONSE_SCHEMA = {
                 "from the body. Empty string if there are none."
             ),
         },
-        "printed_page_number": {
-            "type": "string",
-            "description": (
-                "The page number as printed on the page itself, exactly as it "
-                "appears (may be roman, may be absent). Empty string if the "
-                "page carries no printed number."
-            ),
-        },
         "languages": {
             "type": "array",
             "items": {"type": "string"},
@@ -101,7 +107,6 @@ PAGE_RESPONSE_SCHEMA = {
     "required": [
         "page_type",
         "transcription",
-        "printed_page_number",
         "has_uncertain_text",
     ],
 }
@@ -183,10 +188,7 @@ def build_page_prompt(profile: dict | None, preserve_layout: bool = True) -> str
         "spelling itself untouched. "
         + layout_rule
         + "Separate footnote text from body text: body goes in `transcription`, "
-        "footnotes in `footnotes`. Record the page number printed on the page "
-        "in `printed_page_number` exactly as it appears -- this is often "
-        "different from the page's position in the file, and it is what makes "
-        "the text citable later. "
+        "footnotes in `footnotes`. "
         f"Where you genuinely cannot read something, write {ILLEGIBLE_MARKER} "
         "in place of the unreadable span and set `has_uncertain_text` to true. "
         "Never guess at a word to fill a gap. "

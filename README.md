@@ -3,7 +3,7 @@
 Batch transcription of scanned historical PDFs via the Gemini API, built for a
 long-running free-tier job spread across several machines and many API keys.
 
-**Version 0.4.1 — complete.** Engine, web UI, and Google Sheets publishing.
+**Version 0.5.1 — complete.** Engine, web UI, and Google Sheets publishing.
 
 ---
 
@@ -314,8 +314,18 @@ intended, and that is impossible to tell afterwards unless it is written down.
 
 ## What the export contains
 
-One `.jsonl` per book (one page per line) plus a `.manifest.json`, and one
-`index.json` across the export.
+Three files per book, all named after the PDF — `010.pdf` produces `010.txt`,
+`010.jsonl` and `010.manifest.json` — plus one `index.json` across the export.
+
+**`.txt` is the one to read.** The transcription as plain text, with each page
+break marked so a passage can be traced back to its PDF page, and pages with no
+text labelled rather than left as unexplained gaps.
+
+**`.jsonl` is the one to process.** JSON Lines: one self-contained JSON object
+per line instead of a single big array. That means it can be appended to,
+streamed, and read one line at a time — and if a file is ever cut short it still
+parses up to the break, where a truncated array parses not at all. Any tool that
+reads JSON can read it a line at a time.
 
 Each page record carries the printed page number as it appears on the page
 (often different from the PDF index, and what a citation needs), body text and
@@ -405,11 +415,25 @@ printed page number, and how the page was produced — model, resolution, DPI, k
 tokens, latency. Arrow keys move between pages.
 
 **API Keys** shows each key's live state (active, cooling down, exhausted for the
-day, or dead) with the reason. Secrets are never sent to the browser; only the
-last four characters, which is enough to match a key against AI Studio. A key
-the engine retired can be returned to service by hand — the engine will never do
-that itself, but you may have fixed the account, or the rejection may have come
-from a network problem rather than Google.
+day, or dead) with the reason. You can upload a `keys.json` file, tick which keys
+to use, and edit each key's per-minute and per-day limits with a Save button per
+row — nothing is sent until you press Save, so a half-typed number is never
+applied, and the periodic refresh will not overwrite a row you are editing.
+
+Secrets are never sent to the browser; only the last four characters, which is
+enough to match a key against AI Studio. A key the engine retired can be
+returned to service by hand — the engine will never do that itself, but you may
+have fixed the account, or the rejection may have come from a network problem
+rather than Google.
+
+**At most five keys are used at a time.** With a large pool it is better to work
+a small set hard and bring in a replacement as each is spent than to spread
+every request thinly across all of them. Keys enter in id order; when one
+exhausts for the day the next ticked key takes its place automatically, and
+unticking a key frees its slot immediately. Fewer than five keys is not a
+problem — the window is a ceiling, not a target — and it does not reduce your
+total daily capacity, since every key is still used, just not all at once. One
+worker thread runs per key in play.
 
 **Sheets & Settings** holds the Sheets connection and the publish, export and
 retry actions. Engine settings appear read-only, because changing DPI or
@@ -426,8 +450,12 @@ the bottom, so scrolling back to read something is not yanked away.
 
 ## Publishing to Google Sheets
 
-Transcribe locally, publish when you choose. Each book gets its own tab; an
-`Index` tab lists them all.
+Transcribe locally, publish when you choose.
+
+**Each book's tab is named after its PDF**: `010.pdf` goes to a tab called `010`.
+An `Index` tab lists them all. The only exception is two PDFs in different
+folders sharing a filename — two tabs cannot share a name, so the id is appended
+to those duplicates only, leaving every other tab clean.
 
 Pages are written in chunks to the row matching their page number, using
 `setValues` on a range. That makes publishing **repeatable**: run it twice and
@@ -443,6 +471,79 @@ resolve afterwards.
 
 Publishing runs on a background thread with progress in the UI, since a large
 corpus takes minutes.
+
+### Pages longer than a cell
+
+Google Sheets refuses more than 50,000 characters in one cell, and some pages
+exceed that. Such a page is split across four adjacent **Transcription** columns,
+so rejoining it in the sheet is just:
+
+```
+=C2&D2&E2&F2
+```
+
+Splits land on line breaks rather than mid-word, so each cell begins on a clean
+line and the parts concatenate losslessly. Four columns holds 180,000
+characters; almost every page uses only the first, and the continuation columns
+are kept narrow so they do not push the useful ones off screen.
+
+Overflow goes **sideways, never onto extra rows**. Each page is written to the
+row matching its page number, which is exactly what makes republishing overwrite
+instead of duplicating — continuation rows would break that mapping and bring
+back the duplicate-row problem the batched publisher exists to solve.
+
+A page too long even for four cells has its last cell marked `[TRUNCATED]` and is
+named in the log, rather than failing the upload. The full text is always in the
+`.txt` and `.jsonl` exports. Worth a look if it happens: a page of that length is
+usually a dense index or a model repetition loop rather than ordinary prose.
+
+Chunks are also bounded by total characters, not just row count. A hundred and
+fifty ordinary pages is a small request, but a hundred and fifty very long ones
+would not be, and an oversized request would fail the whole chunk.
+
+## Importing from the old HTML app
+
+`tools/import_legacy.py` is a one-off migration for a backup exported by the
+original single-file app, so work already done is not repeated.
+
+```bash
+ledger scan                                        # register the PDFs first
+python tools/import_legacy.py backup.json          # dry run — shows what would change
+python tools/import_legacy.py backup.json --apply  # commit it
+```
+
+Books are matched to what the scan registered, by path relative to the PDF root
+and then by filename, so the importer never invents a book with no PDF behind
+it. Pages the new engine has already transcribed are never overwritten, which
+makes the script safe to run twice.
+
+Status mapping:
+
+| Old | New | Why |
+|---|---|---|
+| `synced` | `done` | Transcribed and pushed to the sheet |
+| `transcribed_unsynced` | `done` | Transcribed, never pushed |
+| `pending` | `pending` | Left alone |
+| `error` | `pending` | Not the page's fault — see below |
+
+Errors becoming `pending` rather than `failed` is the one real decision, and the
+backup settles it: every error record carries the same message, the browser
+revoking folder permission mid-run. Those pages were never read at all, so
+marking them `failed` would permanently exclude good pages from a run that can
+now actually read them. The importer checks that assumption per record and
+reports any error that looks like something else.
+
+A page the old app classified as `text` but returned no text for is imported as
+`flagged`, not `done` — the same judgement Ledger's own quality check would make,
+so imported pages are held to the same standard as new ones.
+
+**What the old backup lacks.** It recorded page number, type, text and a note,
+but no printed page numbers, no footnotes separated from body text, no detected
+languages and no provenance. Imported pages are therefore thinner than ones the
+new engine produces, and are stamped `legacy-html-app` in their provenance so
+they can always be told apart. If the printed page numbers matter for citation,
+re-transcribing is the only way to get them, and the importer tells you what
+that would cost before you decide.
 
 ## Still to build
 
