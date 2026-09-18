@@ -388,6 +388,16 @@
           result are sent, so a part-finished book publishes cleanly and can be
           republished later.
         </p>
+        <p class="hint">
+          Books already on the sheet and unchanged since are <b>skipped</b>, so if a
+          publish fails part-way, pressing the button again resumes from where it
+          stopped instead of starting over.
+        </p>
+        <div class="checkbox-row">
+          <input type="checkbox" id="publish-force">
+          <label for="publish-force">Republish everything, including books already on the
+          sheet (harmless — the same pages land on the same rows — just slower)</label>
+        </div>
         <div class="field-row">
           <label>Status</label>
           <span class="status-pill no" id="publish-pill">Idle</span>
@@ -604,7 +614,10 @@ function renderBooksList(){
       + '" data-id="' + book.id + '" role="button" tabindex="0">'
       + '<div class="name"><span class="dot ' + dot + '"></span>' + escapeHtml(book.title) + '</div>'
       + '<div class="meta"><span>' + settled + " / " + book.total_pages + ' pages</span>'
-      + '<span>' + (book.pages_flagged ? book.pages_flagged + " flagged" : "") + '</span></div>'
+      + '<span>'
+      +   (book.pages_flagged ? book.pages_flagged + " flagged " : "")
+      +   (!book.needs_publish ? '<span title="On the sheet and unchanged since">&#10003; sheet</span>' : "")
+      + '</span></div>'
       + '<div class="progress-bar">'
       +   '<div class="done" style="width:' + pct(book.pages_done) + '"></div>'
       +   '<div class="flagged" style="width:' + pct(book.pages_flagged) + '"></div>'
@@ -679,8 +692,17 @@ function renderBookDetail(){
       "<h2>" + escapeHtml(book.title) + "</h2>"
     + '<div class="sub">' + escapeHtml(book.rel_path) + " &middot; " + book.total_pages + " pages</div>"
     + renderProfile(book.profile)
+    + '<div class="sub" style="margin-top:-10px;">'
+    +   (book.published_at
+          ? "Sheet: published " + new Date(book.published_at * 1000).toLocaleString()
+            + (book.needs_publish ? " — <b>changed since, will republish</b>" : " — up to date")
+          : "Sheet: not published yet")
+    + "</div>"
     + '<div style="margin:14px 0;display:flex;gap:8px;flex-wrap:wrap;">'
     +   '<button class="ghost small" id="btn-publish-book">Publish this book</button>'
+    +   (book.published_at
+          ? '<button class="ghost small" id="btn-unmark-book" title="Forget that this book was published, so the next publish-all rewrites it">Un-mark as published</button>'
+          : "")
     +   '<button class="ghost small" id="btn-requeue-book">Retry flagged &amp; failed</button>'
     +   '<button class="danger-outline small" id="btn-remove-book">Remove from Ledger</button>'
     + "</div>"
@@ -703,6 +725,17 @@ function renderBookDetail(){
   });
 
   document.getElementById("btn-publish-book").onclick = () => publish(book.id);
+
+  const unmarkButton = document.getElementById("btn-unmark-book");
+  if (unmarkButton){
+    unmarkButton.onclick = async () => {
+      try {
+        await api("/api/books/" + book.id + "/published", {method: "DELETE"});
+        toast("Un-marked. The next publish will rewrite this book.");
+        await selectBook(book.id);
+      } catch (error) { toast(error.message, true); }
+    };
+  }
   document.getElementById("btn-requeue-book").onclick = async () => {
     try {
       const result = await post("/api/books/" + book.id + "/requeue",
@@ -972,6 +1005,9 @@ function renderPublish(){
          + (publish.current_book ? " — " + publish.current_book : "");
   } else if (publish.state === "done"){
     text = "Published " + publish.pages_written + " page(s) in " + publish.elapsed + "s";
+    if (publish.books_skipped){
+      text += " (" + publish.books_skipped + " already current, skipped)";
+    }
   } else if (publish.state === "failed"){
     text = "Failed: " + publish.error;
   }
@@ -981,9 +1017,12 @@ function renderPublish(){
   cancel.style.display = publish.state === "running" ? "inline-block" : "none";
 }
 
-async function publish(bookId){
+async function publish(bookId, force){
   try {
-    await post("/api/sheets/publish", {book_id: bookId == null ? null : bookId});
+    await post("/api/sheets/publish", {
+      book_id: bookId == null ? null : bookId,
+      force: !!force,
+    });
     toast("Publishing started.");
     await refresh();
   } catch (error) { toast(error.message, true); }
@@ -1085,8 +1124,11 @@ async function init(){
     } catch (error) { toast(error.message, true); }
   };
 
-  document.getElementById("btn-publish-all").onclick = () => publish(null);
-  document.getElementById("btn-publish-settings").onclick = () => publish(null);
+  // The sidebar button is always incremental — that is the safe default and
+  // the whole point. The settings button honours the checkbox beside it.
+  document.getElementById("btn-publish-all").onclick = () => publish(null, false);
+  document.getElementById("btn-publish-settings").onclick = () =>
+    publish(null, document.getElementById("publish-force").checked);
   document.getElementById("btn-publish-cancel").onclick = async () => {
     await post("/api/sheets/publish/cancel");
     toast("Cancelling after the current chunk.");

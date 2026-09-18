@@ -70,6 +70,12 @@ CREATE TABLE IF NOT EXISTS books (
     fingerprint     TEXT    NOT NULL DEFAULT '',
 
     file_size       INTEGER NOT NULL DEFAULT 0,
+
+    -- When this book's pages last landed on the Google Sheet in full. NULL
+    -- means never published (or deliberately un-marked). Compared against
+    -- pages.updated_at: a page transcribed after this moment means the sheet
+    -- is stale and a publish-all will pick the book up again.
+    published_at    REAL,
     total_pages     INTEGER NOT NULL DEFAULT 0,
 
     -- Language/script/era profile detected once from the book's first pages,
@@ -259,6 +265,12 @@ class Database:
         wanted = [
             # (table, column, definition)
             ("api_keys", "enabled", "INTEGER NOT NULL DEFAULT 1"),
+
+            # When this book's pages last landed on the Google Sheet in full.
+            # NULL means never published. Compared against pages.updated_at to
+            # decide whether a publish-all needs to touch this book again, which
+            # is what lets a failed publish-all resume instead of restarting.
+            ("books", "published_at", "REAL"),
         ]
 
         for table, column, definition in wanted:
@@ -377,13 +389,50 @@ class Database:
                    SUM(CASE WHEN p.status = 'done'    THEN 1 ELSE 0 END)   AS pages_done,
                    SUM(CASE WHEN p.status = 'flagged' THEN 1 ELSE 0 END)   AS pages_flagged,
                    SUM(CASE WHEN p.status = 'failed'  THEN 1 ELSE 0 END)   AS pages_failed,
-                   SUM(CASE WHEN p.status = 'pending' THEN 1 ELSE 0 END)   AS pages_pending
+                   SUM(CASE WHEN p.status = 'pending' THEN 1 ELSE 0 END)   AS pages_pending,
+
+                   -- The sheet is current when a full publish happened AFTER
+                   -- the newest page result. Computed here, in the one query
+                   -- the UI already polls, rather than per book on demand.
+                   CASE
+                       WHEN b.published_at IS NULL THEN 1
+                       WHEN MAX(CASE WHEN p.status IN ('done', 'flagged')
+                                     THEN p.updated_at ELSE 0 END)
+                            > b.published_at THEN 1
+                       ELSE 0
+                   END                                                     AS needs_publish
               FROM books b
               LEFT JOIN pages p ON p.book_id = b.id
              GROUP BY b.id
              ORDER BY b.rel_path
             """
         ).fetchall()
+
+    def mark_book_published(self, book_id: int, when: float | None = None) -> None:
+        """
+        Record that this book's pages all reached the sheet at `when`.
+
+        Only the publisher calls this, and only after every chunk of the book
+        landed — a publish that failed or was cancelled part-way must leave the
+        book unmarked so the next publish-all picks it up again.
+        """
+        self.conn.execute(
+            "UPDATE books SET published_at = ? WHERE id = ?",
+            (when if when is not None else time.time(), book_id),
+        )
+
+    def clear_book_published(self, book_id: int) -> None:
+        """
+        Forget that this book was published.
+
+        The user's override for everything the timestamp cannot know: a tab
+        deleted or edited in the sheet by hand, a publish that reported success
+        but looks wrong, or plain doubt. The next publish-all will then rewrite
+        the book — harmless, since rows are addressed by page number.
+        """
+        self.conn.execute(
+            "UPDATE books SET published_at = NULL WHERE id = ?", (book_id,)
+        )
 
     def delete_book(self, book_id: int) -> int:
         """

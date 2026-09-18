@@ -12,7 +12,7 @@ requires-python = ">=3.10"
 # setuptools import the package during the build, which fails on some
 # setuptools versions with "No module named 'ledger'". Bump this alongside
 # APP_VERSION in ledger/config.py.
-version = "0.5.1"
+version = "0.7.0"
 
 dependencies = [
     # PDF rendering. Import as `pymupdf`; the old `fitz` name is deprecated
@@ -50,6 +50,14 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "httpx2",
+]
+
+# `pip install -e ".[build]"` before building a standalone application.
+# tzdata is needed at BUILD time on every platform, not just Windows, because
+# Ledger.spec bundles its data files into the application.
+build = [
+    "pyinstaller>=6.0",
+    "tzdata",
 ]
 
 [project.scripts]

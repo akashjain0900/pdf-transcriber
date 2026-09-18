@@ -19,3 +19,8 @@ Dump/
 ledger_transcriber.egg-info/
 # OS generated files
 .DS_Store
+*.manifest
+
+# PyInstaller build output.
+build/
+dist/

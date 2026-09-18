@@ -285,12 +285,30 @@ class PublishJob:
     is running.
     """
 
-    def __init__(self, config, database, url: str, secret: str, book_id=None):
+    def __init__(
+        self,
+        config,
+        database,
+        url: str,
+        secret: str,
+        book_id=None,
+        force: bool = False,
+    ):
         self.config = config
         self.db = database
         self.url = url
         self.secret = secret
         self.book_id = book_id
+
+        # False (the default) publishes only books whose sheet is stale: never
+        # published, un-marked by hand, or transcribed further since their last
+        # publish. That is what turns a failed publish-all into a resumable one
+        # — the books that landed before the failure were stamped, so pressing
+        # the button again continues from where it died.
+        #
+        # True rewrites everything regardless. Harmless (rows are addressed by
+        # page number, so a rewrite produces an identical sheet), just slower.
+        self.force = force
 
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -301,6 +319,7 @@ class PublishJob:
         self.state = "idle"          # idle | running | done | failed | cancelled
         self.books_total = 0
         self.books_done = 0
+        self.books_skipped = 0
         self.pages_written = 0
         self.current_book = ""
         self.error = ""
@@ -315,6 +334,7 @@ class PublishJob:
                 "state": self.state,
                 "books_total": self.books_total,
                 "books_done": self.books_done,
+                "books_skipped": self.books_skipped,
                 "pages_written": self.pages_written,
                 "current_book": self.current_book,
                 "error": self.error,
@@ -332,6 +352,7 @@ class PublishJob:
             self.finished_at = 0.0
             self.error = ""
             self.books_done = 0
+            self.books_skipped = 0
             self.pages_written = 0
             self._cancel = False
 
@@ -355,7 +376,24 @@ class PublishJob:
 
             books = all_books
             if self.book_id is not None:
+                # A book picked by hand is published unconditionally: pointing
+                # at it IS the override, so the up-to-date check does not apply.
                 books = [b for b in books if int(b["id"]) == int(self.book_id)]
+            elif not self.force:
+                # Incremental publish: only books whose sheet is stale.
+                current = [b for b in books if not b["needs_publish"]]
+                books = [b for b in books if b["needs_publish"]]
+
+                with self._lock:
+                    self.books_skipped = len(current)
+
+                if current:
+                    self.db.log(
+                        f"Skipping {len(current)} book(s) already on the sheet "
+                        "and unchanged since. Tick “republish everything” to "
+                        "rewrite them anyway.",
+                        "info",
+                    )
 
             with self._lock:
                 self.books_total = len(books)
@@ -371,6 +409,16 @@ class PublishJob:
 
                 written = self._publish_book(book)
 
+                # Stamp only after every chunk of the book landed, and only if
+                # anything was written at all. A failure raises before this
+                # line and a cancellation returns early with 0, so a book that
+                # is only partly on the sheet is never marked — that is the
+                # guarantee that makes “skip published books” safe to trust.
+                # (A book with no finished pages yet writes nothing and stays
+                # unmarked, so it is picked up once it has content.)
+                if written > 0 and not self._cancel:
+                    self.db.mark_book_published(int(book["id"]))
+
                 with self._lock:
                     self.books_done += 1
                     self.pages_written += written
@@ -382,7 +430,12 @@ class PublishJob:
 
             self.db.log(
                 f"Published {self.pages_written} page(s) across "
-                f"{self.books_done} book(s) to the sheet.",
+                f"{self.books_done} book(s) to the sheet"
+                + (
+                    f" ({self.books_skipped} already current, skipped)."
+                    if self.books_skipped
+                    else "."
+                ),
                 "ok",
             )
 

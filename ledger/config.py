@@ -13,13 +13,116 @@ seeded from a file you keep out of version control.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 
 # Bumped on every behaviour change so a page's `app_version` tells you exactly
 # which build produced it. Cheap traceability; do not skip bumping this.
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.7.0"
+
+
+# ---------------------------------------------------------------------
+# Where things live
+# ---------------------------------------------------------------------
+#
+# Run from a checkout, "here" means the current directory and everything is
+# relative to it, which is what you want while developing.
+#
+# Run as a bundled executable, the current directory is wherever the shortcut
+# happened to point — often C:/Windows/System32. Left alone, that means the
+# database gets created somewhere arbitrary, or fails on permissions, and the
+# symptom looks like your transcriptions have vanished when really you are
+# pointed at a fresh empty database. So a frozen build anchors itself instead.
+
+
+def is_frozen() -> bool:
+    """True when running from a PyInstaller (or similar) bundle."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def executable_dir() -> Path:
+    """The folder containing the running executable."""
+    return Path(sys.executable).resolve().parent
+
+
+def user_data_dir() -> Path:
+    """
+    Per-user writable location, used when the install folder is read-only.
+
+    Installing to C:/Program Files leaves a folder that ordinary users cannot
+    write to, so the database cannot live beside the executable there.
+    """
+    if sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local"
+        return Path(base) / "Ledger"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Ledger"
+    return Path(
+        os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share"
+    ) / "ledger"
+
+
+def _is_writable(directory: Path) -> bool:
+    """Can we actually create files here? Tested, not assumed."""
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        probe = directory / ".ledger-write-test"
+        probe.touch()
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def app_base_dir() -> Path:
+    """
+    The folder that relative data paths are resolved against.
+
+    From a checkout: the current directory, unchanged from before.
+
+    Frozen: beside the executable when that is writable, which keeps an install
+    self-contained and easy to back up or move. Otherwise the per-user data
+    directory, because a Program Files install is not writable and failing there
+    would be both confusing and unnecessary.
+
+    LEDGER_BASE_DIR overrides all of it.
+    """
+    override = os.environ.get("LEDGER_BASE_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+
+    if not is_frozen():
+        return Path.cwd()
+
+    beside_exe = executable_dir()
+    if _is_writable(beside_exe):
+        return beside_exe
+
+    return user_data_dir()
+
+
+def bundled_resource_dir() -> Path:
+    """
+    Where read-only files shipped with the app live (currently the web UI).
+
+    PyInstaller unpacks bundled data to sys._MEIPASS, so `__file__` no longer
+    points at anything on disk. Without this the server starts fine and then
+    serves a 500 for the UI, which is a confusing way to discover the problem.
+    """
+    if is_frozen():
+        # PyInstaller unpacks data to sys._MEIPASS. Ledger.spec ships the UI to
+        # "ledger/static" there, mirroring the source tree, so this returns the
+        # "ledger" directory inside the bundle — the same relative position as
+        # the package directory in a checkout. The two must agree: if you change
+        # the destination in Ledger.spec, change it here too.
+        meipass = getattr(sys, "_MEIPASS", None)
+        base = Path(meipass) if meipass else executable_dir()
+        return base / "ledger"
+
+    # ledger/config.py -> ledger/
+    return Path(__file__).resolve().parent
 
 
 def _load_dotenv(path: Path) -> None:
@@ -81,15 +184,15 @@ class Config:
     # Subfolders are walked recursively. This replaces the browser's
     # File System Access API, which is what made the HTML version
     # undeployable — a server-side path is never revoked.
-    pdf_root: Path = Path("./pdfs")
+    pdf_root: Path = field(default_factory=lambda: app_base_dir() / "pdfs")
 
     # SQLite database holding books, pages, keys and the event log.
     # This file is the single source of truth for run progress.
     # NOTE: it contains your API keys — treat it as a secret.
-    db_path: Path = Path("./ledger.db")
+    db_path: Path = field(default_factory=lambda: app_base_dir() / "ledger.db")
 
     # Where `export` writes JSONL transcriptions and manifests.
-    export_dir: Path = Path("./exports")
+    export_dir: Path = field(default_factory=lambda: app_base_dir() / "exports")
 
     # ---------------------------------------------------------------
     # Machine identity
@@ -258,7 +361,25 @@ class Config:
         Every field can be overridden with a LEDGER_-prefixed variable,
         e.g. LEDGER_DPI=400 or LEDGER_PDF_ROOT=/mnt/scans.
         """
+        base = app_base_dir()
+
+        # A frozen app is not launched from its own folder, so look for .env
+        # beside the executable as well as in the current directory.
         _load_dotenv(Path(dotenv_path))
+        if is_frozen():
+            _load_dotenv(base / ".env")
+
+        def _path(name: str, default_name: str) -> Path:
+            """
+            Resolve a path setting.
+
+            A relative value from .env is interpreted against the base
+            directory rather than the current directory, so a shortcut launched
+            from anywhere still finds the same database.
+            """
+            raw = os.environ.get(name)
+            candidate = Path(raw).expanduser() if raw else base / default_name
+            return candidate if candidate.is_absolute() else (base / candidate)
 
         # Unset means off (see the thinking_level field comment). An explicit
         # empty string also means off, so LEDGER_THINKING_LEVEL= is a valid
@@ -269,9 +390,9 @@ class Config:
         )
 
         return cls(
-            pdf_root=Path(_env_str("LEDGER_PDF_ROOT", "./pdfs")).expanduser(),
-            db_path=Path(_env_str("LEDGER_DB_PATH", "./ledger.db")).expanduser(),
-            export_dir=Path(_env_str("LEDGER_EXPORT_DIR", "./exports")).expanduser(),
+            pdf_root=_path("LEDGER_PDF_ROOT", "pdfs"),
+            db_path=_path("LEDGER_DB_PATH", "ledger.db"),
+            export_dir=_path("LEDGER_EXPORT_DIR", "exports"),
             machine_id=_env_str("LEDGER_MACHINE_ID", "machine-1"),
             dpi=_env_int("LEDGER_DPI", 300),
             image_format=_env_str("LEDGER_IMAGE_FORMAT", "png").lower(),

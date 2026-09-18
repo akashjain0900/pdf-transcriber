@@ -29,7 +29,7 @@ from fastapi.responses import FileResponse, HTMLResponse, Response
 from pydantic import BaseModel
 
 from .appsscript import APPS_SCRIPT_CODE, SCRIPT_VERSION
-from .config import APP_VERSION, Config
+from .config import APP_VERSION, Config, bundled_resource_dir
 from .db import PAGE_FAILED, PAGE_FLAGGED, Database
 from .export import export_all
 from .quota import KeyPool
@@ -39,7 +39,11 @@ from .sheets import PublishJob, SheetsError, test_connection
 from .worker import Engine
 
 
-STATIC_DIR = Path(__file__).parent / "static"
+# Resolved through bundled_resource_dir() rather than __file__, because a
+# frozen build unpacks its data files elsewhere and __file__ no longer points at
+# anything on disk. Getting this wrong gives you a working API that serves a 500
+# for the UI, which is a poor way to find out.
+STATIC_DIR = bundled_resource_dir() / "static"
 
 SETTING_SHEETS_URL = "sheets_url"
 SETTING_SHEETS_SECRET = "sheets_secret"
@@ -87,6 +91,10 @@ class RequeueInput(BaseModel):
 class PublishInput(BaseModel):
     book_id: int | None = None
 
+    # Rewrite books that are already current on the sheet too. Off by default,
+    # so a re-pressed "Publish all" resumes instead of restarting.
+    force: bool = False
+
 
 # ---------------------------------------------------------------------
 # App factory
@@ -121,7 +129,12 @@ def create_app(config: Config) -> FastAPI:
     def index():
         html = STATIC_DIR / "index.html"
         if not html.exists():
-            raise HTTPException(500, "index.html is missing from ledger/static")
+            raise HTTPException(
+                500,
+                f"The web UI is missing. Expected index.html at {html}. In a "
+                "bundled build this means the static folder was not included — "
+                "check the --add-data setting in Ledger.spec.",
+            )
         return HTMLResponse(html.read_text(encoding="utf-8"))
 
     # -----------------------------------------------------------------
@@ -209,6 +222,8 @@ def create_app(config: Config) -> FastAPI:
                 "pages_flagged": int(row["pages_flagged"] or 0),
                 "pages_failed": int(row["pages_failed"] or 0),
                 "profiled": bool(row["profile_json"]),
+                "published_at": row["published_at"],
+                "needs_publish": bool(row["needs_publish"]),
             }
             for row in database.list_books()
         ]
@@ -219,12 +234,19 @@ def create_app(config: Config) -> FastAPI:
         if book is None:
             raise HTTPException(404, "No such book")
 
+        rolled = next(
+            (row for row in database.list_books() if int(row["id"]) == book_id),
+            None,
+        )
+
         return {
             "id": int(book["id"]),
             "title": book["title"],
             "rel_path": book["rel_path"],
             "file_name": book["file_name"],
             "total_pages": int(book["total_pages"]),
+            "published_at": book["published_at"],
+            "needs_publish": bool(rolled["needs_publish"]) if rolled else True,
             "profile": database.get_book_profile(book_id),
             "pages": [
                 {
@@ -313,6 +335,30 @@ def create_app(config: Config) -> FastAPI:
         count = database.requeue_pages(statuses)
         database.log(f"Requeued {count} page(s) across all books.", "info")
         return {"requeued": count}
+
+    @app.delete("/api/books/{book_id}/published")
+    def clear_published(book_id: int):
+        """
+        Un-mark a book as published.
+
+        The escape hatch for everything the timestamp cannot know: a publish
+        that reported success but left the tab looking wrong, a tab edited or
+        deleted in the sheet by hand, or plain doubt. The next publish-all will
+        rewrite this book, which is harmless — rows are addressed by page
+        number, so a rewrite lands on the same cells.
+        """
+        book = database.get_book(book_id)
+        if book is None:
+            raise HTTPException(404, "No such book")
+
+        database.clear_book_published(book_id)
+        database.log(
+            f"“{book['title']}” un-marked as published; the next publish will "
+            "rewrite it.",
+            "info",
+            book_id=book_id,
+        )
+        return {"cleared": True}
 
     @app.delete("/api/books/{book_id}")
     def remove_book(book_id: int):
@@ -531,6 +577,7 @@ def create_app(config: Config) -> FastAPI:
             url,
             database.get_setting(SETTING_SHEETS_SECRET),
             book_id=body.book_id,
+            force=body.force,
         )
         state["publish"] = job
         job.start()

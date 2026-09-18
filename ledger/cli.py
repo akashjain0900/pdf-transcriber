@@ -17,6 +17,7 @@ After `pip install -e .` you get a `ledger` command that works from anywhere:
     ledger status
     ledger export
     ledger requeue --flagged
+    ledger import-legacy backup.json
 
 Without installing, use `python -m ledger.cli <command>` instead — but note
 that only resolves when the current directory IS the project root, because
@@ -45,7 +46,7 @@ import sys
 import time
 from pathlib import Path
 
-from .config import APP_VERSION, Config
+from .config import APP_VERSION, Config, app_base_dir, is_frozen
 from .db import PAGE_FAILED, PAGE_FLAGGED, Database
 from .export import export_all
 from .scanner import scan
@@ -171,6 +172,8 @@ def cmd_check(config: Config, args) -> int:
     # --- Resolved settings ------------------------------------------
     print("Settings")
     print(f"  machine id        {config.machine_id}")
+    print(f"  data base dir     {app_base_dir()}"
+          f"{'  (bundled build)' if is_frozen() else ''}")
     print(f"  model             {config.model}")
     print(f"  media resolution  {config.media_resolution}")
     print(f"  render            {config.dpi} DPI, {config.image_format}"
@@ -473,6 +476,18 @@ def cmd_export(config: Config, args) -> int:
     return 0
 
 
+def cmd_import_legacy(config: Config, args) -> int:
+    """Import a backup exported by the old single-file HTML app."""
+    from .importer import ImportAborted, run_import
+
+    database = _open(config)
+    try:
+        return run_import(config, database, args.backup, apply=args.apply)
+    except ImportAborted as exc:
+        print(f"\n{exc}", file=sys.stderr)
+        return 1
+
+
 def cmd_requeue(config: Config, args) -> int:
     """
     Put flagged and/or failed pages back on the queue.
@@ -545,6 +560,15 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("--port", type=int, default=8000)
     subparsers.add_parser("export", help="Write JSONL exports and manifests")
 
+    import_parser = subparsers.add_parser(
+        "import-legacy",
+        help="Import a backup from the old HTML app (dry run unless --apply)",
+    )
+    import_parser.add_argument("backup", help="Path to transcriptions-backup-*.json")
+    import_parser.add_argument(
+        "--apply", action="store_true", help="Write the changes (default: dry run)"
+    )
+
     requeue_parser = subparsers.add_parser(
         "requeue", help="Return flagged/failed pages to the queue"
     )
@@ -566,6 +590,7 @@ HANDLERS = {
     "serve": cmd_serve,
     "export": cmd_export,
     "requeue": cmd_requeue,
+    "import-legacy": cmd_import_legacy,
 }
 
 

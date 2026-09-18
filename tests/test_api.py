@@ -17,6 +17,7 @@ Run with:  python tests/test_api.py
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import tempfile
@@ -141,6 +142,7 @@ def test_ui_integrity():
     # These are created at runtime by the render functions, not in the markup.
     runtime_ids = {
         "btn-publish-book", "btn-requeue-book", "btn-remove-book",
+        "btn-unmark-book",
     }
     missing = referenced - defined - runtime_ids
 
@@ -177,6 +179,126 @@ def test_ui_integrity():
         all(path.startswith("/api/") for path in called),
         str(called),
     )
+
+
+def test_frozen_paths():
+    print("\nBundled-build path resolution")
+
+    import ledger.config as config_module
+    from ledger.config import app_base_dir, bundled_resource_dir
+
+    # Unfrozen: unchanged behaviour, relative to the current directory.
+    R.check("unfrozen base is the cwd", app_base_dir() == Path.cwd(), str(app_base_dir()))
+    R.check(
+        "unfrozen resources sit next to the package",
+        (bundled_resource_dir() / "static" / "index.html").exists(),
+        str(bundled_resource_dir()),
+    )
+
+    # Frozen: must anchor to the executable, NOT the working directory. Getting
+    # this wrong means a shortcut launch writes the database somewhere arbitrary
+    # and the symptom looks like the transcriptions have vanished.
+    with tempfile.TemporaryDirectory() as tmp:
+        fake_exe_dir = Path(tmp) / "Ledger"
+        fake_exe_dir.mkdir()
+
+        original_frozen = getattr(sys, "frozen", None)
+        original_meipass = getattr(sys, "_MEIPASS", None)
+        original_executable = sys.executable
+        original_cwd = Path.cwd()
+
+        try:
+            sys.frozen = True
+            sys.executable = str(fake_exe_dir / "Ledger")
+            sys._MEIPASS = str(fake_exe_dir / "_internal")
+
+            R.check("frozen build reports itself frozen", config_module.is_frozen())
+            R.check(
+                "frozen base is the executable's folder, not the cwd",
+                app_base_dir() == fake_exe_dir.resolve(),
+                f"{app_base_dir()} vs {fake_exe_dir}",
+            )
+            R.check(
+                "and it is definitely not the working directory",
+                app_base_dir() != original_cwd,
+            )
+
+            # The spec ships the UI to "ledger/static" inside _MEIPASS, and this
+            # must agree with it — the mismatch is a 500 on the UI only.
+            R.check(
+                "frozen resources resolve inside _MEIPASS/ledger",
+                bundled_resource_dir() == Path(sys._MEIPASS) / "ledger",
+                str(bundled_resource_dir()),
+            )
+
+            # An explicit override wins over everything.
+            override = Path(tmp) / "elsewhere"
+            os.environ["LEDGER_BASE_DIR"] = str(override)
+            R.check(
+                "LEDGER_BASE_DIR overrides the anchor",
+                app_base_dir() == override.resolve(),
+                str(app_base_dir()),
+            )
+            del os.environ["LEDGER_BASE_DIR"]
+
+        finally:
+            if original_frozen is None:
+                del sys.frozen
+            else:
+                sys.frozen = original_frozen
+            if original_meipass is None:
+                if hasattr(sys, "_MEIPASS"):
+                    del sys._MEIPASS
+            else:
+                sys._MEIPASS = original_meipass
+            sys.executable = original_executable
+
+
+def test_spec_matches_code():
+    print("\nLedger.spec agrees with the code")
+
+    spec = (Path(__file__).resolve().parent.parent / "Ledger.spec").read_text()
+
+    # These two have to agree, and nothing else checks it: the destination in
+    # the spec and the path bundled_resource_dir() builds. A mismatch is a UI
+    # that 500s in the bundle only, which no other test would catch.
+    R.check(
+        "the spec ships the UI to ledger/static",
+        '("ledger/static", "ledger/static")' in spec,
+    )
+
+    for needed, why in [
+        ("collect_data_files(\"certifi\")", "HTTPS to Google fails without the CA bundle"),
+        ("collect_data_files(\"tzdata\")", "quota.py crashes at import on Windows without it"),
+        ("uvicorn.loops.auto", "uvicorn imports its loop by string"),
+        ("uvicorn.protocols.http.auto", "uvicorn imports its HTTP protocol by string"),
+        ("h11", "the HTTP implementation uvicorn actually uses"),
+    ]:
+        R.check(f"spec declares {needed} ({why})", needed in spec)
+
+    R.check(
+        "onedir, not onefile (startup time and antivirus)",
+        "COLLECT(" in spec,
+    )
+    R.check("UPX disabled (antivirus false positives)", "upx=False" in spec)
+
+
+def test_launcher_routing():
+    print("\nLauncher argument routing")
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    import ledger_app
+
+    # A bare launch (double-click) starts the server.
+    R.check("no arguments starts the server", ledger_app.looks_like_cli([]) is False)
+
+    # Server flags stay with the server.
+    for flag in (["--port", "9000"], ["--host", "0.0.0.0"], ["--no-browser"]):
+        R.check(f"{flag[0]} goes to the server", ledger_app.looks_like_cli(flag) is False)
+
+    # Anything else is a CLI subcommand, so one executable covers both.
+    for command in (["check"], ["scan"], ["import-legacy", "b.json"], ["keys", "list"]):
+        R.check(f"'{command[0]}' goes to the CLI", ledger_app.looks_like_cli(command) is True)
 
 
 def test_status_and_config():
@@ -942,6 +1064,142 @@ def test_publish_flow_stubbed():
             sheets_module._call = original
 
 
+def test_publish_resume():
+    print("\nResumable publishing (the failed-publish-all fix)")
+
+    import ledger.sheets as sheets_module
+
+    with tempfile.TemporaryDirectory() as tmp:
+        client, config, database = make_client(Path(tmp))
+        client.post("/api/scan")
+
+        client.put("/api/settings", json={
+            "sheets_url": "https://script.google.com/macros/s/fake/exec",
+            "sheets_secret": "s",
+        })
+
+        books = client.get("/api/books").json()
+        R.check("both books start needing publish",
+                all(b["needs_publish"] for b in books), str(books))
+
+        # Give every book something to publish.
+        for book in books:
+            database.save_page_result(
+                int(book["id"]), 1, PAGE_DONE,
+                {"page_type": "text", "transcription": f"Tekst voor {book['title']}"},
+                {},
+            )
+
+        calls: list[dict] = []
+        fail_on_tab: list[str] = []
+
+        def fake_call(url, secret, action, payload=None):
+            payload = payload or {}
+            if payload.get("tab") in fail_on_tab:
+                raise sheets_module.SheetsError("simulated Apps Script failure")
+            calls.append(payload)
+            return {"ok": True}
+
+        original = sheets_module._call
+        sheets_module._call = fake_call
+
+        def run_publish(body):
+            client.post("/api/sheets/publish", json=body)
+            import time as _time
+            for _ in range(80):
+                snap = client.get("/api/status").json()["publish"]
+                if snap["state"] in ("done", "failed", "cancelled"):
+                    return snap
+                _time.sleep(0.05)
+            return snap
+
+        try:
+            # --- A failure part-way stamps only what landed -------------
+            # Books publish in rel_path order: boek-1 then boek-2. Fail boek-2.
+            fail_on_tab.append("boek-2")
+            snap = run_publish({})
+            R.check("the job reports the failure", snap["state"] == "failed", str(snap))
+
+            books = {b["title"]: b for b in client.get("/api/books").json()}
+            R.check("the book that landed is marked",
+                    books["boek-1"]["needs_publish"] is False, str(books["boek-1"]))
+            R.check("the failed book is NOT marked",
+                    books["boek-2"]["needs_publish"] is True, str(books["boek-2"]))
+
+            # --- Pressing publish again resumes, not restarts -----------
+            fail_on_tab.clear()
+            calls.clear()
+            snap = run_publish({})
+            R.check("the retry completes", snap["state"] == "done", str(snap))
+            R.check("only the failed book was sent",
+                    {c["tab"] for c in calls} == {"boek-2"},
+                    str({c["tab"] for c in calls}))
+            R.check("the already-published book was counted as skipped",
+                    snap["books_skipped"] == 1, str(snap))
+
+            # --- A publish with nothing stale sends nothing -------------
+            calls.clear()
+            snap = run_publish({})
+            R.check("an up-to-date library publishes nothing",
+                    snap["pages_written"] == 0 and calls == [], str(snap))
+
+            # --- force rewrites everything anyway ------------------------
+            calls.clear()
+            snap = run_publish({"force": True})
+            R.check("force republishes both books",
+                    {c["tab"] for c in calls} == {"boek-1", "boek-2"},
+                    str({c["tab"] for c in calls}))
+
+            # --- New work makes a book stale again -----------------------
+            book_id = int(client.get("/api/books").json()[0]["id"])
+            database.save_page_result(
+                book_id, 2, PAGE_DONE,
+                {"page_type": "text", "transcription": "Nieuwe bladzijde"}, {},
+            )
+            books = client.get("/api/books").json()
+            fresh = next(b for b in books if b["id"] == book_id)
+            other = next(b for b in books if b["id"] != book_id)
+            R.check("a new page result makes its book stale",
+                    fresh["needs_publish"] is True, str(fresh))
+            R.check("the other book stays current",
+                    other["needs_publish"] is False, str(other))
+
+            calls.clear()
+            snap = run_publish({})
+            R.check("the next publish sends only the stale book",
+                    len({c["tab"] for c in calls}) == 1, str(calls))
+
+            # --- Un-mark: the user's override ----------------------------
+            detail = client.get(f"/api/books/{book_id}").json()
+            R.check("book detail exposes the publish stamp",
+                    detail["published_at"] is not None and detail["needs_publish"] is False,
+                    str({k: detail[k] for k in ("published_at", "needs_publish")}))
+
+            R.check("un-marking works",
+                    client.delete(f"/api/books/{book_id}/published")
+                          .json()["cleared"] is True)
+            detail = client.get(f"/api/books/{book_id}").json()
+            R.check("un-marked book needs publish again",
+                    detail["published_at"] is None and detail["needs_publish"] is True,
+                    str({k: detail[k] for k in ("published_at", "needs_publish")}))
+            R.check("un-marking an unknown book is a 404",
+                    client.delete("/api/books/9999/published").status_code == 404)
+
+            calls.clear()
+            run_publish({})
+            R.check("the un-marked book is rewritten on the next publish",
+                    len(calls) >= 1, str(len(calls)))
+
+            # --- Hand-picking a book overrides the stamp -----------------
+            calls.clear()
+            snap = run_publish({"book_id": book_id})
+            R.check("a hand-picked book publishes even when current",
+                    len(calls) == 1 and snap["state"] == "done", str(snap))
+
+        finally:
+            sheets_module._call = original
+
+
 def test_publish_marks_empty_page_types():
     print("\nPublish marks blank and image pages")
 
@@ -976,6 +1234,9 @@ def main():
     for test in (
         test_ui_served,
         test_ui_integrity,
+        test_frozen_paths,
+        test_spec_matches_code,
+        test_launcher_routing,
         test_status_and_config,
         test_scan_and_books,
         test_page_image,
@@ -992,6 +1253,7 @@ def main():
         test_remove_book,
         test_events,
         test_publish_flow_stubbed,
+        test_publish_resume,
         test_publish_marks_empty_page_types,
     ):
         test()

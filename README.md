@@ -3,7 +3,7 @@
 Batch transcription of scanned historical PDFs via the Gemini API, built for a
 long-running free-tier job spread across several machines and many API keys.
 
-**Version 0.5.1 — complete.** Engine, web UI, and Google Sheets publishing.
+**Version 0.7.0 — complete.** Engine, web UI, and Google Sheets publishing.
 
 ---
 
@@ -472,6 +472,25 @@ resolve afterwards.
 Publishing runs on a background thread with progress in the UI, since a large
 corpus takes minutes.
 
+### A failed publish resumes instead of restarting
+
+Each book is stamped `published_at` once **all** of its chunks land — a failure
+or cancellation part-way through a book leaves it unstamped. "Publish all" skips
+books that are stamped and unchanged since, so when a publish dies at book 13 of
+28, pressing the button again sends books 13–28 and skips the first twelve.
+Nothing to select, no range arithmetic.
+
+A book becomes stale again the moment any of its pages gets a new result, so
+incremental publishes always carry new work. The "republish everything" checkbox
+ignores the stamps and rewrites the lot — harmless, since rows are addressed by
+page number, just slower. Publishing a single book from its detail page always
+publishes it: pointing at a book *is* the override.
+
+**Un-mark as published**, on each book's detail page, clears the stamp by hand.
+It exists because the timestamp cannot know everything: a tab edited or deleted
+in the sheet, a publish that reported success but looks wrong, or plain doubt.
+The next publish rewrites that book.
+
 ### Pages longer than a cell
 
 Google Sheets refuses more than 50,000 characters in one cell, and some pages
@@ -544,6 +563,88 @@ new engine produces, and are stamped `legacy-html-app` in their provenance so
 they can always be told apart. If the printed page numbers matter for citation,
 re-transcribing is the only way to get them, and the importer tells you what
 that would cost before you decide.
+
+## Building a standalone application
+
+Produces a folder you can copy to any machine, with Python and every dependency
+inside it. Nothing needs installing on the target.
+
+```powershell
+pip install -e ".[build]"
+build_windows.bat
+```
+
+Or directly, on any platform:
+
+```bash
+pip install -e ".[build]"
+pyinstaller Ledger.spec --noconfirm
+```
+
+Output is `dist/Ledger/`. Copy that whole folder. Expect roughly 280 MB — most
+of it PyMuPDF, numpy and pydantic-core.
+
+### Using the built application
+
+```
+Ledger.exe                      server + browser
+Ledger.exe check                validate the setup
+Ledger.exe check --live         ...and send one real request
+Ledger.exe scan                 register PDFs
+Ledger.exe --port 9000          server on another port
+Ledger.exe import-legacy b.json import an old HTML-app backup
+```
+
+Double-clicking starts the server and opens a browser. Any argument runs the
+CLI instead, so one executable covers both.
+
+**Where its data goes.** Beside the executable: `ledger.db`, `exports/`, and
+`pdfs/` unless you point `LEDGER_PDF_ROOT` elsewhere in a `.env` file placed next
+to `Ledger.exe`. If the install folder is not writable — a `C:/Program Files`
+install, say — it falls back to `%LOCALAPPDATA%\Ledger`. `Ledger.exe check`
+prints which one is in use, and `LEDGER_BASE_DIR` overrides it.
+
+This matters more than it sounds. Relative paths resolve against the *working
+directory*, and a Start Menu shortcut typically has a working directory of
+`C:/Windows/System32`. Anchoring to the executable is what stops the database
+being created somewhere arbitrary — a failure whose symptom is that all your
+transcriptions appear to have vanished, when really you are looking at a fresh
+empty database.
+
+### What the spec handles for you
+
+Four dependencies cannot be worked out by static analysis, and each fails in a
+different, confusing way:
+
+| Bundled explicitly | What happens without it |
+|---|---|
+| `ledger/static/index.html` | Server runs; the UI returns 500 |
+| `certifi`'s CA bundle | Starts fine, then every Gemini call fails certificate verification |
+| `tzdata` | Import-time crash on Windows — quota accounting builds a US/Pacific zone at module level |
+| uvicorn's loop and HTTP protocol | "Could not import module" at startup |
+
+One requirement that is easy to miss: the destination in `Ledger.spec` and the
+path `bundled_resource_dir()` builds in `config.py` must agree. A mismatch is a
+UI that 500s in the bundled build only. `tests/test_api.py` asserts both sides.
+
+### Notes
+
+**onedir, not onefile.** A onefile build unpacks the whole bundle to a temp
+directory on every launch — several seconds of startup with PyMuPDF and numpy,
+and a frequent antivirus trigger, since an executable writing then running files
+in temp is exactly what malware does. For something that runs for weeks, onedir
+starts instantly.
+
+**Unsigned executables** trip Windows SmartScreen on first run: "More info →
+Run anyway", once per machine. Signing needs a certificate. UPX compression is
+disabled in the spec for the same class of reason.
+
+**For a real installer**, wrap `dist/Ledger` with [Inno Setup](https://jrsoftware.org/isinfo.php)
+— free, and gives you a Start Menu entry and an uninstaller.
+
+**Delete `build/` between builds** if anything behaves oddly. A stale build
+directory is the most common cause of a build that succeeds but ships the
+previous version's files; `build_windows.bat` does this for you.
 
 ## Still to build
 
